@@ -311,21 +311,20 @@ def llm_forecast(
     return None
 
 
-# Cross-vendor production ensemble: 2 Anthropic (one with extended thinking)
-# + 1 OpenAI.
+# Production ensemble: 1 Anthropic (extended-thinking) + 1 OpenAI.
 #
-# The "claude-opus-4-7-thinking" entry uses Anthropic's extended-thinking
-# mode (budget 1500 reasoning tokens) on edge-case forecasts. Slightly
-# slower than vanilla Opus but better on cases that need multi-step
-# reasoning.
+# Trimmed 2026-05-14 from 3 -> 2 members to give headroom under the
+# server's 30s per-event timeout. The remaining members cover two
+# vendors (Anthropic + OpenAI) so error decorrelation is preserved;
+# we lose the median's tiebreaker property at N=2, but median == mean
+# is fine for two well-calibrated members.
 #
-# Gemini was dropped 2026-05-14 after the free-tier quota (20 req/day
-# per model) blew up under backtest load. To re-enable: upgrade Gemini
-# billing and add "gemini-2.5-flash" back to this tuple — the dispatch
-# logic in _vendor_for / _gemini_forecast remains.
+# Re-add models here if/when latency margins allow:
+#   - "claude-sonnet-4-6": faster Anthropic for a 3-way median
+#   - "gemini-2.5-flash": third vendor (requires paid Gemini billing;
+#     free tier blew its quota in backtest)
 ENSEMBLE_MODELS = (
     "claude-opus-4-7-thinking",
-    "claude-sonnet-4-6",
     "gpt-5-mini",
 )
 

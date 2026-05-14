@@ -83,6 +83,25 @@ def main() -> int:
     out_path = args.output or get_calibration_path()
     save_calibration(table, out_path)
     print(f"Calibration table → {out_path}")
+
+    # Optionally mirror to GCS for live-agent consumption (Cloud Run reads
+    # this with a 60s cache, so freshness is automatic).
+    import os
+    import subprocess
+
+    gcs_uri = os.environ.get("CALIBRATION_GCS_URI")
+    if gcs_uri:
+        try:
+            result = subprocess.run(
+                ["gcloud", "storage", "cp", str(out_path), gcs_uri, "--quiet"],
+                check=True,
+                capture_output=True,
+                timeout=30,
+                text=True,
+            )
+            print(f"  mirrored to {gcs_uri}")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            print(f"  GCS upload failed (ignored): {e}", file=sys.stderr)
     print(f"{'Bucket':<14}{'N':>5}{'mean_p':>9}{'mean_actual':>13}{'bias':>9}")
     for b in table:
         bias = b["mean_actual"] - b["mean_p"]

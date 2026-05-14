@@ -27,6 +27,7 @@ RUN pip install --upgrade pip \
         "anthropic>=0.40" \
         "openai>=1.40" \
         "google-genai>=1.0" \
+        "google-cloud-storage>=2.18" \
         "fastapi>=0.115" \
         "uvicorn[standard]>=0.32" \
         "pydantic>=2.8" \

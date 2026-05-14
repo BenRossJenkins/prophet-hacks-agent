@@ -100,12 +100,50 @@ def test_get_calibration_table_uses_env(tmp_path: Path, monkeypatch):
         out,
     )
     monkeypatch.setenv("CALIBRATION_PATH", str(out))
+    monkeypatch.delenv("CALIBRATION_GCS_URI", raising=False)
     # Reset module-level cache
     from agent import calibrate as cal_mod
     cal_mod._cache.clear()
     table = get_calibration_table()
     assert table is not None
     assert len(table) == 1
+
+
+def test_get_calibration_table_prefers_gcs_when_uri_set(tmp_path: Path, monkeypatch):
+    # File on disk has bucket count 1
+    out = tmp_path / "cal.json"
+    save_calibration(
+        [{"bucket_lo": 0.0, "bucket_hi": 0.1, "n": 1, "mean_p": 0.05, "mean_actual": 0.1}],
+        out,
+    )
+    monkeypatch.setenv("CALIBRATION_PATH", str(out))
+    monkeypatch.setenv("CALIBRATION_GCS_URI", "gs://bucket/file.json")
+
+    # GCS returns a 2-bucket table
+    gcs_table = [
+        {"bucket_lo": 0.3, "bucket_hi": 0.4, "n": 5, "mean_p": 0.35, "mean_actual": 0.7},
+        {"bucket_lo": 0.6, "bucket_hi": 0.7, "n": 5, "mean_p": 0.65, "mean_actual": 0.4},
+    ]
+    from agent import calibrate as cal_mod
+    cal_mod._cache.clear()
+    with patch("agent.calibrate._load_from_gcs", return_value=gcs_table):
+        table = get_calibration_table()
+    assert table == gcs_table
+
+
+def test_get_calibration_table_falls_back_to_disk_when_gcs_fails(tmp_path: Path, monkeypatch):
+    out = tmp_path / "cal.json"
+    disk_table = [
+        {"bucket_lo": 0.0, "bucket_hi": 0.1, "n": 1, "mean_p": 0.05, "mean_actual": 0.1}
+    ]
+    save_calibration(disk_table, out)
+    monkeypatch.setenv("CALIBRATION_PATH", str(out))
+    monkeypatch.setenv("CALIBRATION_GCS_URI", "gs://bucket/missing.json")
+    from agent import calibrate as cal_mod
+    cal_mod._cache.clear()
+    with patch("agent.calibrate._load_from_gcs", return_value=None):
+        table = get_calibration_table()
+    assert table == disk_table
 
 
 def test_predict_applies_calibration_when_table_present(tmp_path: Path, monkeypatch):

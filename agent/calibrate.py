@@ -1,21 +1,31 @@
-"""Post-hoc calibration table — fit + apply.
+"""Post-hoc calibration table: fit + apply.
 
 Mirrors the upstream PR we shipped (feat/forecast-calibrate-command).
-Bundled here so the live agent can apply a fitted calibration in
-real time during the eval window, even before the upstream PR merges.
+Bundled here so the live agent can apply a fitted calibration in real
+time during the eval window, even before the upstream PR merges.
 
 Workflow during the May 17-28 eval:
   1. Agent serves /predict; every prediction is logged via
      agent.prediction_log to data/predictions.jsonl.
   2. scripts/resolve_predictions.py runs daily, marking resolved
-     predictions with their outcomes into data/resolved_predictions.jsonl.
-  3. scripts/fit_calibration.py runs daily, fitting a calibration table
-     from those resolutions into data/calibration.json.
-  4. The live agent (this module) reads data/calibration.json on each
-     predict() call and applies it before returning.
+     predictions with their outcomes into
+     data/resolved_predictions.jsonl.
+  3. scripts/fit_calibration.py runs daily, fitting a calibration
+     table to data/calibration.json AND optionally uploading it to
+     a GCS bucket (`CALIBRATION_GCS_URI`).
+  4. The live agent (this module) reads the table on each predict()
+     call (60s in-process cache).
 
-If the calibration file doesn't exist or is empty, predictions pass
-through unchanged.
+Two storage backends, in order of precedence:
+
+  - CALIBRATION_GCS_URI (gs://bucket/path/file.json): preferred for
+    deployed agents. Lets the Cloud Run instance pick up daily fits
+    pushed by the local daily-submit script with no redeploy.
+  - CALIBRATION_PATH (filesystem path; defaults to data/calibration.json):
+    used for local development and as the fallback when GCS is
+    unavailable.
+
+If neither produces a valid table, predictions pass through unchanged.
 """
 
 from __future__ import annotations
@@ -114,23 +124,58 @@ def get_calibration_path() -> str:
     return os.environ.get("CALIBRATION_PATH", DEFAULT_PATH)
 
 
+def get_calibration_gcs_uri() -> str | None:
+    return os.environ.get("CALIBRATION_GCS_URI") or None
+
+
+def _load_from_gcs(uri: str) -> list[dict[str, Any]] | None:
+    """Pull a calibration JSON from gs://bucket/object. Never raises."""
+    if not uri.startswith("gs://"):
+        return None
+    try:
+        from google.cloud import storage  # lazy import
+
+        rest = uri[len("gs://"):]
+        bucket_name, _, blob_name = rest.partition("/")
+        if not bucket_name or not blob_name:
+            return None
+        client = storage.Client()
+        blob = client.bucket(bucket_name).blob(blob_name)
+        text = blob.download_as_text(timeout=10)
+        data = json.loads(text)
+        if data.get("version") != CALIBRATION_VERSION:
+            return None
+        return data.get("buckets") or None
+    except Exception as e:
+        logger.warning("GCS calibration fetch failed for %s: %s", uri, e)
+        return None
+
+
 _cache: dict[str, tuple[float, list[dict] | None]] = {}
 _CACHE_TTL = 60.0  # seconds
 
 
 def get_calibration_table() -> list[dict[str, Any]] | None:
-    """Read the calibration table from disk, with a 60s in-process cache.
+    """Return the active calibration table with a 60s in-process cache.
 
-    Cached so we don't disk-read on every /predict call but still pick up
-    new tables produced by the daily fit script within a minute.
+    Tries GCS first (CALIBRATION_GCS_URI), then falls back to the local
+    path. Either backend returning None means "no calibration", and
+    predictions pass through unchanged.
     """
     import time
 
-    path = get_calibration_path()
+    gcs_uri = get_calibration_gcs_uri()
+    cache_key = gcs_uri or get_calibration_path()
     now = time.time()
-    cached = _cache.get(path)
+    cached = _cache.get(cache_key)
     if cached is not None and (now - cached[0]) < _CACHE_TTL:
         return cached[1]
-    table = load_calibration(path)
-    _cache[path] = (now, table)
+
+    table: list[dict[str, Any]] | None = None
+    if gcs_uri:
+        table = _load_from_gcs(gcs_uri)
+    if table is None:
+        table = load_calibration(get_calibration_path())
+
+    _cache[cache_key] = (now, table)
     return table
