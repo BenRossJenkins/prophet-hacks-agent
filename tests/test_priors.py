@@ -30,10 +30,17 @@ def test_denied_set_is_explicit():
     assert LLM_DENIED_CATEGORIES == frozenset({"Climate and Weather", "Crypto"})
 
 
-def test_category_prior_returns_none_by_default():
-    # Phase 4 will populate handlers; for now everything returns None.
-    assert category_prior({"category": "Climate and Weather", "title": "x"}) is None
-    assert category_prior({"category": "Politics", "title": "x"}) is None
+def test_category_prior_routes_to_handlers():
+    # Without external services, weather/crypto/manifold handlers return None
+    # but they DO get dispatched. We verify dispatch by patching the network
+    # layer of each handler.
+    with patch("agent.weather._points_lookup", return_value=None):
+        assert category_prior({"category": "Climate and Weather", "title": "x"}) is None
+    with patch("agent.manifold._search", return_value=[]):
+        assert category_prior({"category": "Politics", "title": "x"}) is None
+        assert category_prior({"category": "Sports", "title": "x"}) is None
+    # Categories without handlers still return None outright.
+    assert category_prior({"category": "Entertainment", "title": "x"}) is None
 
 
 # ---- predict() integration -----------------------------------------------
@@ -64,11 +71,13 @@ def test_predict_skips_llm_for_denied_category():
 def test_predict_uses_llm_for_allowed_category():
     from agent.predict import predict
 
+    # Manifold returns nothing → fall through to LLM → speculative shrink.
     with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.manifold._search", return_value=[]
+    ), patch(
         "agent.predict.llm_forecast_ensemble", return_value=(0.72, "base rate")
     ):
         out = predict(_event("Politics"))
-    # Output shrunk by speculative α=0.15 (rationale lacks "grounded" markers).
     assert out["p_yes"] == pytest.approx(0.72 * 0.85 + 0.5 * 0.15)
     assert "LLM" in out["rationale"]
 
