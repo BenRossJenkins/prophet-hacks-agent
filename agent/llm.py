@@ -1,8 +1,13 @@
-"""Minimal LLM client for forecasting illiquid markets.
+"""Multi-vendor LLM client for forecasting illiquid markets.
 
-Used as the fallback when Kalshi gives us no usable price signal at all.
-Defensive: returns None on any failure (missing key, parse error, timeout,
-out-of-range output) so the caller can fall back to a uniform 0.5.
+Supports Anthropic Claude, OpenAI GPT-5 family, and Google Gemini. Each
+vendor gets a native web-search tool wired in so the model can ground its
+answer in current data. All vendors share the same calibration-focused
+system prompt and JSON-output parser; the median across an ensemble is
+what the agent ultimately uses.
+
+Defensive throughout: any single vendor failure (missing key, network,
+parse error, out-of-range output) returns None and the caller falls back.
 """
 
 from __future__ import annotations
@@ -17,10 +22,9 @@ import statistics
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-opus-4-7"
-MAX_TOKENS = 2000   # leaves headroom for search-call rounds + final answer
+MAX_TOKENS = 2000
 TIMEOUT_SECONDS = 45.0
 MAX_WEB_SEARCHES = 3
-WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": MAX_WEB_SEARCHES}
 
 SYSTEM_PROMPT = """\
 You are an expert forecaster producing calibrated probability estimates.
@@ -64,7 +68,7 @@ def _build_user_prompt(event: dict) -> str:
 
 def parse_response(text: str) -> tuple[float, str] | None:
     """Pull a JSON forecast out of the model's response. None on any failure."""
-    s = text.strip()
+    s = (text or "").strip()
     if s.startswith("```"):
         s = re.sub(r"^```(?:json)?\s*", "", s)
         s = re.sub(r"\s*```\s*$", "", s)
@@ -89,46 +93,62 @@ def parse_response(text: str) -> tuple[float, str] | None:
     return p, rationale or "LLM forecast"
 
 
-_client = None
+def _vendor_for(model: str) -> str:
+    """Detect vendor from model name."""
+    if model.startswith("claude"):
+        return "anthropic"
+    if model.startswith("gpt") or model.startswith("o3") or model.startswith("o4"):
+        return "openai"
+    if model.startswith("gemini"):
+        return "google"
+    return "anthropic"
 
 
-def _get_client():
-    global _client
-    if _client is not None:
-        return _client
+# ---------------------------------------------------------------------------
+# Anthropic
+# ---------------------------------------------------------------------------
+
+WEB_SEARCH_TOOL_ANTHROPIC = {
+    "type": "web_search_20250305",
+    "name": "web_search",
+    "max_uses": MAX_WEB_SEARCHES,
+}
+
+_anthropic_client = None
+
+
+def _get_anthropic_client():
+    global _anthropic_client
+    if _anthropic_client is not None:
+        return _anthropic_client
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return None
     try:
         import anthropic
 
-        _client = anthropic.Anthropic(api_key=api_key, timeout=TIMEOUT_SECONDS)
+        _anthropic_client = anthropic.Anthropic(api_key=api_key, timeout=TIMEOUT_SECONDS)
     except Exception as e:
         logger.warning("Anthropic client init failed: %s", e)
         return None
-    return _client
+    return _anthropic_client
 
 
-def _extract_text(content_blocks) -> str:
-    """Concatenate text from all TextBlock items, skipping tool blocks."""
+def _anthropic_extract_text(content_blocks) -> str:
     parts: list[str] = []
     for block in content_blocks:
         block_type = getattr(block, "type", None)
-        if block_type == "text" or hasattr(block, "text") and block_type is None:
+        if block_type == "text" or (hasattr(block, "text") and block_type is None):
             text = getattr(block, "text", None)
             if text:
                 parts.append(text)
     return "\n".join(parts)
 
 
-def llm_forecast(
-    event: dict, *, model: str | None = None, with_web_search: bool = True
-) -> tuple[float, str] | None:
-    """Call Claude to forecast the event. Returns (p_yes, rationale) or None on failure."""
-    client = _get_client()
+def _anthropic_forecast(event: dict, model: str, with_web_search: bool) -> tuple[float, str] | None:
+    client = _get_anthropic_client()
     if client is None:
         return None
-    model = model or os.environ.get("FORECAST_MODEL", DEFAULT_MODEL)
     kwargs: dict = {
         "model": model,
         "max_tokens": MAX_TOKENS,
@@ -136,21 +156,137 @@ def llm_forecast(
         "messages": [{"role": "user", "content": _build_user_prompt(event)}],
     }
     if with_web_search:
-        kwargs["tools"] = [WEB_SEARCH_TOOL]
-
+        kwargs["tools"] = [WEB_SEARCH_TOOL_ANTHROPIC]
     try:
         resp = client.messages.create(**kwargs)
-        text = _extract_text(resp.content)
+        text = _anthropic_extract_text(resp.content)
     except Exception as e:
-        logger.warning("LLM call failed (%s): %s", model, e)
+        logger.warning("Anthropic call failed (%s): %s", model, e)
         return None
     return parse_response(text)
 
 
-# Default ensemble. Different Anthropic models give partially-uncorrelated
-# errors. With cross-vendor models (OpenAI / Gemini) the decorrelation is
-# stronger; we can wire those in if keys are present.
-ENSEMBLE_MODELS = ("claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001")
+# ---------------------------------------------------------------------------
+# OpenAI
+# ---------------------------------------------------------------------------
+
+_openai_client = None
+
+
+def _get_openai_client():
+    global _openai_client
+    if _openai_client is not None:
+        return _openai_client
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from openai import OpenAI
+
+        _openai_client = OpenAI(api_key=api_key, timeout=TIMEOUT_SECONDS)
+    except Exception as e:
+        logger.warning("OpenAI client init failed: %s", e)
+        return None
+    return _openai_client
+
+
+def _openai_forecast(event: dict, model: str, with_web_search: bool) -> tuple[float, str] | None:
+    client = _get_openai_client()
+    if client is None:
+        return None
+    tools = [{"type": "web_search"}] if with_web_search else None
+    try:
+        kwargs: dict = {
+            "model": model,
+            "instructions": SYSTEM_PROMPT,
+            "input": _build_user_prompt(event),
+            "max_output_tokens": MAX_TOKENS,
+        }
+        if tools:
+            kwargs["tools"] = tools
+        resp = client.responses.create(**kwargs)
+        text = getattr(resp, "output_text", None) or ""
+    except Exception as e:
+        logger.warning("OpenAI call failed (%s): %s", model, e)
+        return None
+    return parse_response(text)
+
+
+# ---------------------------------------------------------------------------
+# Google Gemini
+# ---------------------------------------------------------------------------
+
+_gemini_client = None
+
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is not None:
+        return _gemini_client
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from google import genai
+
+        _gemini_client = genai.Client(api_key=api_key)
+    except Exception as e:
+        logger.warning("Gemini client init failed: %s", e)
+        return None
+    return _gemini_client
+
+
+def _gemini_forecast(event: dict, model: str, with_web_search: bool) -> tuple[float, str] | None:
+    client = _get_gemini_client()
+    if client is None:
+        return None
+    try:
+        from google.genai import types
+
+        config_kwargs: dict = {"system_instruction": SYSTEM_PROMPT}
+        if with_web_search:
+            config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+        config = types.GenerateContentConfig(**config_kwargs)
+        resp = client.models.generate_content(
+            model=model,
+            contents=_build_user_prompt(event),
+            config=config,
+        )
+        text = getattr(resp, "text", None) or ""
+    except Exception as e:
+        logger.warning("Gemini call failed (%s): %s", model, e)
+        return None
+    return parse_response(text)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def llm_forecast(
+    event: dict, *, model: str | None = None, with_web_search: bool = True
+) -> tuple[float, str] | None:
+    """Call a single LLM (vendor auto-detected). Returns (p_yes, rationale) or None."""
+    model = model or os.environ.get("FORECAST_MODEL", DEFAULT_MODEL)
+    vendor = _vendor_for(model)
+    if vendor == "anthropic":
+        return _anthropic_forecast(event, model, with_web_search)
+    if vendor == "openai":
+        return _openai_forecast(event, model, with_web_search)
+    if vendor == "google":
+        return _gemini_forecast(event, model, with_web_search)
+    logger.warning("Unknown vendor for model %s", model)
+    return None
+
+
+# Four-model cross-vendor ensemble: 2 Anthropic + 1 OpenAI + 1 Google.
+ENSEMBLE_MODELS = (
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "gpt-5-mini",
+    "gemini-2.5-flash",
+)
 
 
 def llm_forecast_ensemble(
@@ -193,3 +329,7 @@ def llm_forecast_ensemble(
         f"{m}: {out[1][:120]}" for m, out in results
     )
     return p_median, rationale
+
+
+# Backwards-compat: the old internal helper name. Tests use _extract_text.
+_extract_text = _anthropic_extract_text
