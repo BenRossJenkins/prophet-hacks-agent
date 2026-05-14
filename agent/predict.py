@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
+from agent.calibrate import apply_calibration, get_calibration_table
 from agent.kalshi import get_market
 from agent.llm import llm_forecast, llm_forecast_ensemble
 from agent.prediction_log import log_prediction
@@ -265,8 +266,27 @@ def _forecast(event: EventRequest) -> PredictionResponse:
     )
 
 
+def _maybe_calibrate(resp: PredictionResponse) -> PredictionResponse:
+    """If a calibration table is present on disk, apply it. Never raises."""
+    try:
+        table = get_calibration_table()
+    except Exception:
+        return resp
+    if not table:
+        return resp
+    raw = resp.p_yes
+    adjusted = apply_calibration(raw, table)
+    if adjusted == raw:
+        return resp
+    return PredictionResponse(
+        p_yes=max(0.01, min(0.99, adjusted)),
+        rationale=f"{resp.rationale}; calibrated {raw:.3f}→{adjusted:.3f}",
+    )
+
+
 def predict(event: dict) -> dict:
     resp = _forecast(EventRequest(**event))
+    resp = _maybe_calibrate(resp)
     log_prediction(event, resp.p_yes, resp.rationale)
     return {"p_yes": resp.p_yes, "rationale": resp.rationale}
 
@@ -277,6 +297,7 @@ app = FastAPI(title="Prophet Hacks Forecast Agent")
 @app.post("/predict", response_model=PredictionResponse)
 async def predict_endpoint(event: EventRequest) -> PredictionResponse:
     resp = _forecast(event)
+    resp = _maybe_calibrate(resp)
     log_prediction(event.model_dump(), resp.p_yes, resp.rationale)
     return resp
 
