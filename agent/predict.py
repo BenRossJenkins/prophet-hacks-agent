@@ -48,7 +48,11 @@ MIN_VOL_24H = 10.0    # USD — below this the book is noise.
                       # (scripts/sweep_params.py) showed -0.015 Brier on
                       # the candlestick fixture (2026-05-14): markets with
                       # $10-50 24h vol still carry useful price signal.
-MAX_SPREAD = 0.20     # dollars — wider and the midprice is uninformative
+MAX_SPREAD = 0.50     # dollars — wider and the midprice is uninformative.
+                      # Sweep on the diversified 267-entry fixture preferred
+                      # 0.50 over 0.20 (~0.001 Brier). Wider tolerance lets
+                      # more mid-tier markets use depth-mid; volume-weighted
+                      # shrinkage already handles the inflated uncertainty.
 NO_ARB_TOL = 0.02     # |yes_ask + no_ask − 1| > this → book broken
 
 # Shrinkage curve: alpha = scale / (vol + scale), clipped to [MIN, MAX].
