@@ -243,11 +243,59 @@ def test_implied_prob_none_when_no_signal():
 # ---- predict() end-to-end ------------------------------------------------
 
 
-def test_predict_falls_back_when_kalshi_fails():
-    with patch("agent.predict.get_market", return_value=None):
+def test_predict_falls_back_to_uniform_when_both_market_and_llm_fail():
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.llm_forecast", return_value=None
+    ):
         out = predict(_event())
     assert out["p_yes"] == 0.5
     assert "kalshi fetch failed" in out["rationale"]
+    assert "LLM unavailable" in out["rationale"]
+
+
+def test_predict_uses_llm_when_no_market_data():
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.llm_forecast", return_value=(0.72, "base rate ~70%")
+    ):
+        out = predict(_event())
+    assert out["p_yes"] == pytest.approx(0.72)
+    assert "LLM" in out["rationale"]
+    assert "base rate" in out["rationale"]
+
+
+def test_predict_uses_llm_when_no_price_signal():
+    # Book has zero everywhere → _market_implied_prob returns None.
+    market = {
+        "yes_bid_dollars": "0",
+        "yes_ask_dollars": "0",
+        "last_price_dollars": "0",
+        "volume_24h_fp": "0",
+    }
+    with patch("agent.predict.get_market", return_value=market), patch(
+        "agent.predict.llm_forecast", return_value=(0.18, "rare event")
+    ):
+        out = predict(_event())
+    assert out["p_yes"] == pytest.approx(0.18)
+    assert "no price signal" in out["rationale"]
+    assert "LLM" in out["rationale"]
+
+
+def test_predict_does_not_call_llm_when_market_is_usable():
+    market = {
+        "yes_bid_dollars": "0.40",
+        "yes_ask_dollars": "0.42",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.58",
+        "no_ask_dollars": "0.60",
+        "last_price_dollars": "0.41",
+        "volume_24h_fp": "1000",
+    }
+    with patch("agent.predict.get_market", return_value=market), patch(
+        "agent.predict.llm_forecast"
+    ) as llm_mock:
+        predict(_event())
+    llm_mock.assert_not_called()
 
 
 def test_predict_liquid_market_with_fresh_book():

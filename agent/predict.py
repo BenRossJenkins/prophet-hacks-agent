@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 from agent.kalshi import get_market
+from agent.llm import llm_forecast
 
 
 class EventRequest(BaseModel):
@@ -165,18 +166,25 @@ def _market_implied_prob(
     )
 
 
+def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
+    """Reach for the LLM when the market gives us no usable price. Defensive."""
+    out = llm_forecast(event.model_dump())
+    if out is None:
+        return PredictionResponse(p_yes=0.5, rationale=f"{reason}; LLM unavailable; uniform prior")
+    p, llm_rationale = out
+    p = max(0.01, min(0.99, p))
+    return PredictionResponse(p_yes=p, rationale=f"{reason}; LLM: {llm_rationale}")
+
+
 def _forecast(event: EventRequest) -> PredictionResponse:
     market = get_market(event.market_ticker)
     if market is None:
-        return PredictionResponse(
-            p_yes=0.5,
-            rationale=f"kalshi fetch failed for {event.market_ticker}; uniform prior",
-        )
+        return _llm_fallback(event, reason=f"kalshi fetch failed for {event.market_ticker}")
 
     arb_violated = _no_arb_violated(market)
     raw_p, rationale = _market_implied_prob(market, arb_violated=arb_violated)
     if raw_p is None:
-        return PredictionResponse(p_yes=0.5, rationale=f"{rationale}; uniform prior")
+        return _llm_fallback(event, reason=rationale)
 
     vol_24h = _f(market, "volume_24h_fp")
     alpha = _shrink_alpha(vol_24h)
