@@ -56,6 +56,21 @@ STALE_HOURS = 6.0
 STALE_ALPHA_MULTIPLIER = 2.0
 APPLY_STALENESS = False
 
+# LLM-output shrinkage. Two tiers based on whether the rationale suggests
+# the model did real research vs speculating from base rates.
+LLM_SHRINK_GROUNDED = 0.05
+LLM_SHRINK_SPECULATIVE = 0.15
+_LLM_GROUNDED_MARKERS = (
+    "search",
+    "according to",
+    "as of",
+    "source",
+    "report",
+    "data shows",
+    "polls",
+    "polling",
+)
+
 
 def _f(market: dict, key: str) -> float:
     try:
@@ -167,12 +182,22 @@ def _market_implied_prob(
     )
 
 
+def _llm_shrink_alpha(rationale: str) -> float:
+    """Pick LLM shrinkage strength based on whether it appears data-grounded."""
+    rationale_lower = rationale.lower()
+    if any(marker in rationale_lower for marker in _LLM_GROUNDED_MARKERS):
+        return LLM_SHRINK_GROUNDED
+    return LLM_SHRINK_SPECULATIVE
+
+
 def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
     """Reach for an alternative when the market gives us no usable price.
 
     Order of preference:
       1. Category-specific external-data prior (Phase 4).
-      2. LLM forecast, if the category isn't on the LLM denylist.
+      2. LLM forecast, if the category isn't on the LLM denylist. The LLM
+         output is shrunk toward 0.5 — more if the rationale doesn't show
+         signs of having grounded the answer in current data.
       3. Uniform 0.5 prior.
     """
     event_d = event.model_dump()
@@ -191,9 +216,14 @@ def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
     out = llm_forecast(event_d)
     if out is None:
         return PredictionResponse(p_yes=0.5, rationale=f"{reason}; LLM unavailable; uniform prior")
-    p, llm_rationale = out
-    p = max(0.01, min(0.99, p))
-    return PredictionResponse(p_yes=p, rationale=f"{reason}; LLM: {llm_rationale}")
+    p_raw, llm_rationale = out
+    alpha = _llm_shrink_alpha(llm_rationale)
+    p = _shrink_and_clamp(p_raw, alpha=alpha)
+    tier = "grounded" if alpha == LLM_SHRINK_GROUNDED else "speculative"
+    return PredictionResponse(
+        p_yes=p,
+        rationale=f"{reason}; LLM ({tier}, α={alpha}, raw={p_raw:.3f}): {llm_rationale}",
+    )
 
 
 def _forecast(event: EventRequest) -> PredictionResponse:

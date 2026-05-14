@@ -68,7 +68,8 @@ def test_predict_uses_llm_for_allowed_category():
         "agent.predict.llm_forecast", return_value=(0.72, "base rate")
     ):
         out = predict(_event("Politics"))
-    assert out["p_yes"] == pytest.approx(0.72)
+    # Output shrunk by speculative α=0.15 (rationale lacks "grounded" markers).
+    assert out["p_yes"] == pytest.approx(0.72 * 0.85 + 0.5 * 0.15)
     assert "LLM" in out["rationale"]
 
 
