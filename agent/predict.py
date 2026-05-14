@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from agent.kalshi import get_market
 from agent.llm import llm_forecast, llm_forecast_ensemble
+from agent.prediction_log import log_prediction
 from agent.priors import category_prior, llm_allowed_for
 
 
@@ -256,6 +257,7 @@ def _forecast(event: EventRequest) -> PredictionResponse:
 
 def predict(event: dict) -> dict:
     resp = _forecast(EventRequest(**event))
+    log_prediction(event, resp.p_yes, resp.rationale)
     return {"p_yes": resp.p_yes, "rationale": resp.rationale}
 
 
@@ -264,7 +266,9 @@ app = FastAPI(title="Prophet Hacks Forecast Agent")
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict_endpoint(event: EventRequest) -> PredictionResponse:
-    return _forecast(event)
+    resp = _forecast(event)
+    log_prediction(event.model_dump(), resp.p_yes, resp.rationale)
+    return resp
 
 
 @app.post("/trade")
