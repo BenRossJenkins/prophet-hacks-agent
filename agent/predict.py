@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from agent.kalshi import get_market
 from agent.llm import llm_forecast
+from agent.priors import category_prior, llm_allowed_for
 
 
 class EventRequest(BaseModel):
@@ -167,8 +168,27 @@ def _market_implied_prob(
 
 
 def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
-    """Reach for the LLM when the market gives us no usable price. Defensive."""
-    out = llm_forecast(event.model_dump())
+    """Reach for an alternative when the market gives us no usable price.
+
+    Order of preference:
+      1. Category-specific external-data prior (Phase 4).
+      2. LLM forecast, if the category isn't on the LLM denylist.
+      3. Uniform 0.5 prior.
+    """
+    event_d = event.model_dump()
+    prior_out = category_prior(event_d)
+    if prior_out is not None:
+        p, prior_rationale = prior_out
+        p = max(0.01, min(0.99, p))
+        return PredictionResponse(p_yes=p, rationale=f"{reason}; prior: {prior_rationale}")
+
+    if not llm_allowed_for(event.category):
+        return PredictionResponse(
+            p_yes=0.5,
+            rationale=f"{reason}; LLM gated for category='{event.category}'; uniform prior",
+        )
+
+    out = llm_forecast(event_d)
     if out is None:
         return PredictionResponse(p_yes=0.5, rationale=f"{reason}; LLM unavailable; uniform prior")
     p, llm_rationale = out
