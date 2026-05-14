@@ -61,6 +61,55 @@ def _search(query: str, limit: int = 10) -> list[dict[str, Any]]:
         return []
 
 
+def _llm_search_query(title: str) -> str | None:
+    """Use a small LLM to extract a better search query from a Kalshi title.
+
+    Kalshi titles are often verbose ("Will the temperature in...") whereas
+    Manifold's full-text search rewards concise topic phrases. A 3-5 word
+    query like "Trump pardon Hunter Biden" beats the full sentence form.
+
+    Returns None on any failure — caller falls back to the rule-based
+    `_clean_query`.
+    """
+    try:
+        # Lazy import to keep manifold.py's import cost low for callers
+        # that don't trigger the LLM rephrase path.
+        from agent.llm import _get_anthropic_client
+
+        client = _get_anthropic_client()
+        if client is None:
+            return None
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=80,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Extract a 3-5 word search query from this prediction "
+                        "market title. Use the most distinctive nouns and proper "
+                        "names. Output ONLY the query — no quotes, no "
+                        "explanation.\n\nTitle: " + title
+                    ),
+                }
+            ],
+        )
+        text = ""
+        for block in resp.content:
+            block_type = getattr(block, "type", None)
+            if block_type == "text" or hasattr(block, "text"):
+                t = getattr(block, "text", None)
+                if t:
+                    text += t
+        text = text.strip().strip('"').strip("'")
+        if not text or len(text) > 200:
+            return None
+        return text
+    except Exception as e:
+        logger.warning("LLM query rephrase failed: %s", e)
+        return None
+
+
 def _is_usable(market: dict[str, Any]) -> bool:
     if market.get("outcomeType") != "BINARY":
         return False
@@ -81,23 +130,34 @@ def _is_usable(market: dict[str, Any]) -> bool:
 def manifold_prior(event: dict) -> tuple[float, str] | None:
     """Search Manifold for a matching binary market; return its probability.
 
-    Returns (p_yes, rationale) on success, or None if no usable match is
-    found.
+    Two-pass search: first uses a rule-based cleaned query; if that
+    returns no usable matches, asks a small LLM to rephrase the title
+    as a concise topic query and tries again. This roughly doubles the
+    match rate on niche or verbosely-titled markets.
+
+    Returns (p_yes, rationale) on success, or None if no usable match.
     """
     title = event.get("title", "")
+    if not title:
+        return None
+
     query = _clean_query(title)
-    if not query:
-        return None
-
-    results = _search(query)
-    if not results:
-        return None
-
+    results = _search(query) if query else []
     usable = [m for m in results if _is_usable(m)]
+
+    rephrase_note = ""
+    if not usable:
+        rephrased = _llm_search_query(title)
+        if rephrased and rephrased.lower() != query.lower():
+            results = _search(rephrased)
+            usable = [m for m in results if _is_usable(m)]
+            if usable:
+                rephrase_note = f" (LLM-rephrased to '{rephrased}')"
+
     if not usable:
         return None
 
-    best = usable[0]  # Manifold's `score` sort already ranks by relevance.
+    best = usable[0]
     p = float(best["probability"])
     p = max(0.01, min(0.99, p))
 
@@ -105,5 +165,5 @@ def manifold_prior(event: dict) -> tuple[float, str] | None:
     volume = best.get("volume", 0)
     return p, (
         f"Manifold market '{question}' has probability {best['probability']:.3f} "
-        f"(volume {volume:.0f} mana)"
+        f"(volume {volume:.0f} mana){rephrase_note}"
     )

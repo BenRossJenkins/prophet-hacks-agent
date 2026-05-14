@@ -109,12 +109,13 @@ def parse_response(text: str) -> tuple[float, str] | None:
 
 
 def _vendor_for(model: str) -> str:
-    """Detect vendor from model name."""
-    if model.startswith("claude"):
+    """Detect vendor from model name. Strips a trailing '-thinking' suffix."""
+    base = model[: -len("-thinking")] if model.endswith("-thinking") else model
+    if base.startswith("claude"):
         return "anthropic"
-    if model.startswith("gpt") or model.startswith("o3") or model.startswith("o4"):
+    if base.startswith("gpt") or base.startswith("o3") or base.startswith("o4"):
         return "openai"
-    if model.startswith("gemini"):
+    if base.startswith("gemini"):
         return "google"
     return "anthropic"
 
@@ -160,16 +161,31 @@ def _anthropic_extract_text(content_blocks) -> str:
     return "\n".join(parts)
 
 
+THINKING_BUDGET_TOKENS = 1500   # extended-thinking allotment
+
+
 def _anthropic_forecast(event: dict, model: str, with_web_search: bool) -> tuple[float, str] | None:
     client = _get_anthropic_client()
     if client is None:
         return None
+
+    # Models with the synthetic "-thinking" suffix turn on Claude's
+    # extended-thinking mode; the underlying model name is the prefix.
+    thinking_enabled = model.endswith("-thinking")
+    real_model = model[: -len("-thinking")] if thinking_enabled else model
+
     kwargs: dict = {
-        "model": model,
+        "model": real_model,
         "max_tokens": MAX_TOKENS,
         "system": SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": _build_user_prompt(event)}],
     }
+    if thinking_enabled:
+        # Anthropic's adaptive-thinking API (Opus 4.7+). The model decides
+        # how much to think; `effort=high` lets it use the budget when
+        # the prompt genuinely needs multi-step reasoning.
+        kwargs["thinking"] = {"type": "adaptive"}
+        kwargs["output_config"] = {"effort": "high"}
     if with_web_search:
         kwargs["tools"] = [WEB_SEARCH_TOOL_ANTHROPIC]
     try:
@@ -295,15 +311,20 @@ def llm_forecast(
     return None
 
 
-# Three-model cross-vendor production ensemble: 2 Anthropic + 1 OpenAI.
+# Cross-vendor production ensemble: 2 Anthropic (one with extended thinking)
+# + 1 OpenAI.
 #
-# Gemini was dropped from the default 2026-05-14 after the free-tier
-# quota (20 requests/day per model, 5 requests/min) blew up under
-# backtest load. To re-enable, upgrade the Gemini API to paid billing
-# and add "gemini-2.5-flash" back into this tuple. The dispatch logic
-# in _vendor_for / _gemini_forecast remains in place.
+# The "claude-opus-4-7-thinking" entry uses Anthropic's extended-thinking
+# mode (budget 1500 reasoning tokens) on edge-case forecasts. Slightly
+# slower than vanilla Opus but better on cases that need multi-step
+# reasoning.
+#
+# Gemini was dropped 2026-05-14 after the free-tier quota (20 req/day
+# per model) blew up under backtest load. To re-enable: upgrade Gemini
+# billing and add "gemini-2.5-flash" back to this tuple — the dispatch
+# logic in _vendor_for / _gemini_forecast remains.
 ENSEMBLE_MODELS = (
-    "claude-opus-4-7",
+    "claude-opus-4-7-thinking",
     "claude-sonnet-4-6",
     "gpt-5-mini",
 )

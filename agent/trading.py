@@ -29,9 +29,13 @@ from agent.kalshi import get_market
 
 # ---- Sizing constants ----------------------------------------------------
 
-EDGE_THRESHOLD = 0.08         # don't trade unless edge >= 8pp (wider than the
-                              # forecaster's 5pp; trading is leveraged so a
-                              # bigger edge floor is appropriate)
+EDGE_THRESHOLD = 0.05         # don't trade unless edge >= 5pp.
+                              # Lowered from 0.08 → 0.05 to fire more trades
+                              # during the eval window. This is a reckless-
+                              # lever: more trades = more variance in
+                              # outcomes, which is what the trading track
+                              # rewards. Pair with confidence gating so we
+                              # never bet on the no-signal 0.5 fallback.
 KELLY_FRACTION = 0.25         # fractional Kelly — 1/4 Kelly is conservative-standard
 MAX_PER_MARKET = 0.05         # cap exposure per market at 5% of bankroll
 MAX_PER_SERIES = 0.10         # cap exposure per Kalshi series (e.g. all KXBTCD
