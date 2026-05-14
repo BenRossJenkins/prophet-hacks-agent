@@ -7,10 +7,12 @@ out-of-range output) so the caller can fall back to a uniform 0.5.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import os
 import re
+import statistics
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +142,54 @@ def llm_forecast(
         resp = client.messages.create(**kwargs)
         text = _extract_text(resp.content)
     except Exception as e:
-        logger.warning("LLM call failed: %s", e)
+        logger.warning("LLM call failed (%s): %s", model, e)
         return None
     return parse_response(text)
+
+
+# Default ensemble. Different Anthropic models give partially-uncorrelated
+# errors. With cross-vendor models (OpenAI / Gemini) the decorrelation is
+# stronger; we can wire those in if keys are present.
+ENSEMBLE_MODELS = ("claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001")
+
+
+def llm_forecast_ensemble(
+    event: dict, *, models: tuple[str, ...] = ENSEMBLE_MODELS, with_web_search: bool = True
+) -> tuple[float, str] | None:
+    """Run several models in parallel, return median p_yes + concatenated rationales."""
+    if not models:
+        return None
+    if len(models) == 1:
+        return llm_forecast(event, model=models[0], with_web_search=with_web_search)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(models)) as ex:
+        futures = {
+            ex.submit(llm_forecast, event, model=m, with_web_search=with_web_search): m
+            for m in models
+        }
+        results: list[tuple[str, tuple[float, str]]] = []
+        for fut in concurrent.futures.as_completed(futures):
+            model = futures[fut]
+            try:
+                out = fut.result()
+            except Exception as e:
+                logger.warning("ensemble member %s raised: %s", model, e)
+                continue
+            if out is not None:
+                results.append((model, out))
+
+    if not results:
+        return None
+
+    p_values = [out[0] for _, out in results]
+    p_median = statistics.median(p_values)
+
+    def _short(model: str) -> str:
+        parts = model.split("-")
+        return parts[1] if len(parts) > 1 else model
+
+    parts = [f"{_short(m)}={out[0]:.3f}" for m, out in results]
+    rationale = f"ensemble[{','.join(parts)}] → median={p_median:.3f}; " + "; ".join(
+        f"{m}: {out[1][:120]}" for m, out in results
+    )
+    return p_median, rationale

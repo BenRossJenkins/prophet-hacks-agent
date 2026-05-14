@@ -21,7 +21,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 from agent.kalshi import get_market
-from agent.llm import llm_forecast
+from agent.llm import llm_forecast, llm_forecast_ensemble
 from agent.priors import category_prior, llm_allowed_for
 
 
@@ -213,7 +213,9 @@ def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
             rationale=f"{reason}; LLM gated for category='{event.category}'; uniform prior",
         )
 
-    out = llm_forecast(event_d)
+    # Ensemble over multiple Claude variants; gracefully degrades to a single
+    # call if some members fail.
+    out = llm_forecast_ensemble(event_d)
     if out is None:
         return PredictionResponse(p_yes=0.5, rationale=f"{reason}; LLM unavailable; uniform prior")
     p_raw, llm_rationale = out

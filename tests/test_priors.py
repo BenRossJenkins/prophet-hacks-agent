@@ -54,7 +54,7 @@ def test_predict_skips_llm_for_denied_category():
 
     with patch("agent.predict.get_market", return_value=None), patch(
         "agent.predict.category_prior", return_value=None
-    ), patch("agent.predict.llm_forecast") as llm_mock:
+    ), patch("agent.predict.llm_forecast_ensemble") as llm_mock:
         out = predict(_event("Climate and Weather"))
     assert out["p_yes"] == 0.5
     assert "LLM gated" in out["rationale"]
@@ -65,7 +65,7 @@ def test_predict_uses_llm_for_allowed_category():
     from agent.predict import predict
 
     with patch("agent.predict.get_market", return_value=None), patch(
-        "agent.predict.llm_forecast", return_value=(0.72, "base rate")
+        "agent.predict.llm_forecast_ensemble", return_value=(0.72, "base rate")
     ):
         out = predict(_event("Politics"))
     # Output shrunk by speculative α=0.15 (rationale lacks "grounded" markers).
@@ -78,7 +78,7 @@ def test_predict_prefers_category_prior_over_llm():
 
     with patch("agent.predict.get_market", return_value=None), patch(
         "agent.predict.category_prior", return_value=(0.85, "NWS forecast")
-    ), patch("agent.predict.llm_forecast") as llm_mock:
+    ), patch("agent.predict.llm_forecast_ensemble") as llm_mock:
         out = predict(_event("Climate and Weather"))
     assert out["p_yes"] == pytest.approx(0.85)
     assert "prior" in out["rationale"]

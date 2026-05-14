@@ -245,7 +245,7 @@ def test_implied_prob_none_when_no_signal():
 
 def test_predict_falls_back_to_uniform_when_both_market_and_llm_fail():
     with patch("agent.predict.get_market", return_value=None), patch(
-        "agent.predict.llm_forecast", return_value=None
+        "agent.predict.llm_forecast_ensemble", return_value=None
     ):
         out = predict(_event())
     assert out["p_yes"] == 0.5
@@ -256,7 +256,7 @@ def test_predict_falls_back_to_uniform_when_both_market_and_llm_fail():
 def test_predict_uses_llm_when_no_market_data():
     # No "grounded" marker in rationale → speculative shrink (α=0.15).
     with patch("agent.predict.get_market", return_value=None), patch(
-        "agent.predict.llm_forecast", return_value=(0.72, "base rate ~70%")
+        "agent.predict.llm_forecast_ensemble", return_value=(0.72, "base rate ~70%")
     ):
         out = predict(_event())
     expected = 0.72 * 0.85 + 0.5 * 0.15
@@ -267,9 +267,8 @@ def test_predict_uses_llm_when_no_market_data():
 
 
 def test_predict_grounded_llm_gets_less_shrinkage():
-    # Rationale mentions "search" → grounded shrink (α=0.05).
     with patch("agent.predict.get_market", return_value=None), patch(
-        "agent.predict.llm_forecast",
+        "agent.predict.llm_forecast_ensemble",
         return_value=(0.95, "web search found Reuters article confirming"),
     ):
         out = predict(_event())
@@ -279,19 +278,16 @@ def test_predict_grounded_llm_gets_less_shrinkage():
 
 
 def test_predict_speculative_llm_gets_more_shrinkage():
-    grounded_p = None
-    speculative_p = None
     with patch("agent.predict.get_market", return_value=None), patch(
-        "agent.predict.llm_forecast",
+        "agent.predict.llm_forecast_ensemble",
         return_value=(0.95, "based on general knowledge of similar events"),
     ):
         speculative_p = predict(_event())["p_yes"]
     with patch("agent.predict.get_market", return_value=None), patch(
-        "agent.predict.llm_forecast",
+        "agent.predict.llm_forecast_ensemble",
         return_value=(0.95, "as of today's news search"),
     ):
         grounded_p = predict(_event())["p_yes"]
-    # Both shrink the 0.95 toward 0.5, but speculative pulls harder.
     assert grounded_p > speculative_p
     assert grounded_p < 0.95
 
@@ -305,7 +301,7 @@ def test_predict_uses_llm_when_no_price_signal():
         "volume_24h_fp": "0",
     }
     with patch("agent.predict.get_market", return_value=market), patch(
-        "agent.predict.llm_forecast", return_value=(0.18, "rare event")
+        "agent.predict.llm_forecast_ensemble", return_value=(0.18, "rare event")
     ):
         out = predict(_event())
     # 0.18 shrunk toward 0.5 with speculative α=0.15 → 0.18*0.85 + 0.5*0.15 = 0.228
@@ -326,7 +322,7 @@ def test_predict_does_not_call_llm_when_market_is_usable():
         "volume_24h_fp": "1000",
     }
     with patch("agent.predict.get_market", return_value=market), patch(
-        "agent.predict.llm_forecast"
+        "agent.predict.llm_forecast_ensemble"
     ) as llm_mock:
         predict(_event())
     llm_mock.assert_not_called()
