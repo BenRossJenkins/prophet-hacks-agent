@@ -9,9 +9,11 @@ from agent.trading import (
     KELLY_FRACTION,
     MAX_PER_CATEGORY,
     MAX_PER_MARKET,
+    MAX_PER_SERIES,
     Position,
     PositionBook,
     TradeDecision,
+    _series_for,
     decide,
     kelly_fraction,
     sized_fraction,
@@ -238,14 +240,48 @@ def test_position_book_enforces_per_market_cap():
 
 def test_position_book_enforces_per_category_cap():
     book = PositionBook(starting_bankroll=1000.0)
-    # Open 5 separate markets, each at 5% per market in same category
+    # Open 5 separate markets in DIFFERENT series so the per-series cap
+    # doesn't bind. 5 * 5% = 25% = category cap.
     for i in range(5):
-        d = _decision_buy_yes(ticker=f"M{i}", price=0.50, size=0.05)
+        d = _decision_buy_yes(ticker=f"S{i}-A-T100", price=0.50, size=0.05)
         book.attempt_open(d, category="Sports")
-    # 5 * 5% = 25% = category cap. A 6th market should hit zero capacity.
-    d6 = _decision_buy_yes(ticker="M6", price=0.50, size=0.05)
+    d6 = _decision_buy_yes(ticker="S5-A-T100", price=0.50, size=0.05)
     pos = book.attempt_open(d6, category="Sports")
     assert pos is None
+
+
+def test_position_book_enforces_per_series_cap():
+    book = PositionBook(starting_bankroll=1000.0)
+    # Open two markets in the same series KXBTCD, each at 5% per-market cap.
+    # 2 * 5% = 10% = MAX_PER_SERIES. A third in the same series should be rejected.
+    d1 = _decision_buy_yes(ticker="KXBTCD-26MAY-T80000", price=0.50, size=0.05)
+    d2 = _decision_buy_yes(ticker="KXBTCD-26MAY-T81000", price=0.50, size=0.05)
+    d3 = _decision_buy_yes(ticker="KXBTCD-26MAY-T82000", price=0.50, size=0.05)
+    p1 = book.attempt_open(d1, category="Crypto")
+    p2 = book.attempt_open(d2, category="Crypto")
+    p3 = book.attempt_open(d3, category="Crypto")
+    assert p1 is not None and p1.cost_basis == pytest.approx(50.0)
+    assert p2 is not None and p2.cost_basis == pytest.approx(50.0)
+    assert p3 is None
+
+
+def test_per_series_cap_allows_different_series_in_same_category():
+    book = PositionBook(starting_bankroll=1000.0)
+    # Open two markets in DIFFERENT series, same category — should both succeed.
+    d1 = _decision_buy_yes(ticker="KXBTCD-26MAY-T80000", price=0.50, size=0.05)
+    d2 = _decision_buy_yes(ticker="KXETHD-26MAY-T3500", price=0.50, size=0.05)
+    p1 = book.attempt_open(d1, category="Crypto")
+    p2 = book.attempt_open(d2, category="Crypto")
+    assert p1 is not None
+    assert p2 is not None
+
+
+def test_series_for():
+    assert _series_for("KXBTCD-26MAY1413-T90000") == "KXBTCD"
+    assert _series_for("KXTRUMPACT-26MAY10-T7") == "KXTRUMPACT"
+    assert _series_for("KXATPCHALLENGERMATCH-26MAY14-FERALE") == "KXATPCHALLENGERMATCH"
+    assert _series_for("") == ""
+    assert _series_for("nodash") == "nodash"
 
 
 def test_position_book_resolves_winning_yes():

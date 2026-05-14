@@ -34,6 +34,8 @@ EDGE_THRESHOLD = 0.08         # don't trade unless edge >= 8pp (wider than the
                               # bigger edge floor is appropriate)
 KELLY_FRACTION = 0.25         # fractional Kelly — 1/4 Kelly is conservative-standard
 MAX_PER_MARKET = 0.05         # cap exposure per market at 5% of bankroll
+MAX_PER_SERIES = 0.10         # cap exposure per Kalshi series (e.g. all KXBTCD
+                              # markets together — they're highly correlated)
 MAX_PER_CATEGORY = 0.25       # cap exposure per category at 25% of bankroll
 
 # Confidence-based Kelly scaling. Multiplied with KELLY_FRACTION above.
@@ -105,6 +107,23 @@ def _f(d: dict, key: str) -> float:
         return float(d.get(key, "0") or 0)
     except (ValueError, TypeError):
         return 0.0
+
+
+def _series_for(market_ticker: str) -> str:
+    """Extract the Kalshi series prefix from a market ticker.
+
+    Examples:
+      KXBTCD-26MAY1413-T90000     → 'KXBTCD'
+      KXTRUMPACT-26MAY10-T7       → 'KXTRUMPACT'
+      KXATPCHALLENGERMATCH-...    → 'KXATPCHALLENGERMATCH'
+
+    All Kalshi tickers follow the SERIES-... convention; the prefix is
+    everything up to the first '-'. Markets in the same series are highly
+    correlated (same underlying with different strikes / participants).
+    """
+    if not market_ticker:
+        return ""
+    return market_ticker.split("-", 1)[0]
 
 
 def _build_hold(
@@ -261,6 +280,13 @@ class PositionBook:
         pos = self.positions.get(market_ticker)
         return pos.cost_basis if pos else 0.0
 
+    def exposure_in_series(self, series_ticker: str) -> float:
+        return sum(
+            p.cost_basis
+            for p in self.positions.values()
+            if _series_for(p.market_ticker) == series_ticker
+        )
+
     def exposure_in_category(self, category: str) -> float:
         return sum(p.cost_basis for p in self.positions.values() if p.category == category)
 
@@ -304,6 +330,15 @@ class PositionBook:
         market_cap = basis * MAX_PER_MARKET
         allowed_by_market = max(0.0, market_cap - existing_in_market)
 
+        # Apply per-series cap (correlated-bet correction). Markets sharing
+        # a Kalshi series prefix (KXBTCD, KXTRUMPACT, ...) are different
+        # strikes on the same underlying; effective Kelly should treat them
+        # as one bet, not N independent ones.
+        series = _series_for(decision.market_ticker)
+        existing_in_series = self.exposure_in_series(series)
+        series_cap = basis * MAX_PER_SERIES
+        allowed_by_series = max(0.0, series_cap - existing_in_series)
+
         # Apply per-category cap
         existing_in_cat = self.exposure_in_category(category)
         cat_cap = basis * MAX_PER_CATEGORY
@@ -312,7 +347,9 @@ class PositionBook:
         # Apply remaining cash
         allowed_by_cash = max(0.0, self.cash)
 
-        actual_cost = min(desired_cost, allowed_by_market, allowed_by_cat, allowed_by_cash)
+        actual_cost = min(
+            desired_cost, allowed_by_market, allowed_by_series, allowed_by_cat, allowed_by_cash
+        )
         if actual_cost <= 0:
             return None
 
