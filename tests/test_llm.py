@@ -1,6 +1,32 @@
 from __future__ import annotations
 
-from agent.llm import parse_response
+from agent.llm import _extract_text, parse_response
+
+
+class _TextBlock:
+    def __init__(self, text: str) -> None:
+        self.type = "text"
+        self.text = text
+
+
+class _ToolUseBlock:
+    def __init__(self) -> None:
+        self.type = "server_tool_use"
+        self.text = None
+
+
+def test_extract_text_single_block():
+    assert _extract_text([_TextBlock("hello")]) == "hello"
+
+
+def test_extract_text_skips_tool_blocks():
+    blocks = [_ToolUseBlock(), _TextBlock("answer"), _ToolUseBlock()]
+    assert _extract_text(blocks) == "answer"
+
+
+def test_extract_text_joins_multiple_text_blocks():
+    blocks = [_TextBlock("hello"), _ToolUseBlock(), _TextBlock("world")]
+    assert _extract_text(blocks) == "hello\nworld"
 
 
 def test_parse_plain_json():

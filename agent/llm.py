@@ -15,24 +15,33 @@ import re
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-opus-4-7"
-MAX_TOKENS = 400
-TIMEOUT_SECONDS = 10.0
+MAX_TOKENS = 2000   # leaves headroom for search-call rounds + final answer
+TIMEOUT_SECONDS = 45.0
+MAX_WEB_SEARCHES = 3
+WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": MAX_WEB_SEARCHES}
 
 SYSTEM_PROMPT = """\
-You are an expert forecaster trained for calibrated probability estimation.
+You are an expert forecaster producing calibrated probability estimates.
 
 Your task: estimate the probability that the given binary event resolves YES.
+
+You have a web_search tool. Use it whenever the event depends on
+current/recent information you can't be confident about from training
+data alone — election state, current weather, sports outcomes today,
+markets that have already moved, news within the last few weeks.
 
 CALIBRATION RULES:
 - Consider base rates for similar events before adjusting on details.
 - Weight evidence by reliability AND recency.
-- Account for uncertainty - don't be overconfident.
-- Extremes (p < 0.05 or p > 0.95) require very strong, specific evidence.
-- If you don't have enough information, return p between 0.30 and 0.70.
+- Don't be overconfident. Extremes (p < 0.05 or p > 0.95) require
+  very strong, specific evidence.
+- If you don't have enough information even after searching, return
+  p between 0.30 and 0.70.
 
-Output ONLY a single-line valid JSON object:
+When you have your final answer, output ONLY a single JSON object on
+its own line:
 {"p_yes": <float in [0.01, 0.99]>, "rationale": "<one short sentence>"}
-No other text."""
+No other text in the final message."""
 
 
 def _build_user_prompt(event: dict) -> str:
@@ -98,20 +107,38 @@ def _get_client():
     return _client
 
 
-def llm_forecast(event: dict, *, model: str | None = None) -> tuple[float, str] | None:
+def _extract_text(content_blocks) -> str:
+    """Concatenate text from all TextBlock items, skipping tool blocks."""
+    parts: list[str] = []
+    for block in content_blocks:
+        block_type = getattr(block, "type", None)
+        if block_type == "text" or hasattr(block, "text") and block_type is None:
+            text = getattr(block, "text", None)
+            if text:
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def llm_forecast(
+    event: dict, *, model: str | None = None, with_web_search: bool = True
+) -> tuple[float, str] | None:
     """Call Claude to forecast the event. Returns (p_yes, rationale) or None on failure."""
     client = _get_client()
     if client is None:
         return None
     model = model or os.environ.get("FORECAST_MODEL", DEFAULT_MODEL)
+    kwargs: dict = {
+        "model": model,
+        "max_tokens": MAX_TOKENS,
+        "system": SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": _build_user_prompt(event)}],
+    }
+    if with_web_search:
+        kwargs["tools"] = [WEB_SEARCH_TOOL]
+
     try:
-        resp = client.messages.create(
-            model=model,
-            max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": _build_user_prompt(event)}],
-        )
-        text = resp.content[0].text
+        resp = client.messages.create(**kwargs)
+        text = _extract_text(resp.content)
     except Exception as e:
         logger.warning("LLM call failed: %s", e)
         return None

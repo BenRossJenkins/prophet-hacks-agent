@@ -56,8 +56,15 @@ def aggregate(entries: list[dict[str, Any]], with_llm: bool = False) -> dict:
 
     results: list[dict] = []
     if with_llm:
+        # Web search would leak resolution info on settled markets. Backtest
+        # only exercises the model's own knowledge as of training cutoff.
+        import functools
+        from agent import llm as llm_mod
+
+        no_search_llm = functools.partial(llm_mod.llm_forecast, with_web_search=False)
         ctx_mgrs = [
             patch("agent.predict.get_market", side_effect=_market_lookup_factory(entries)),
+            patch("agent.predict.llm_forecast", side_effect=no_search_llm),
         ]
     else:
         ctx_mgrs = [
