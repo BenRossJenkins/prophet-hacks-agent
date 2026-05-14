@@ -11,8 +11,14 @@ def test_weather_is_denied():
     assert llm_allowed_for("Climate and Weather") is False
 
 
-def test_financials_is_denied():
-    assert llm_allowed_for("Financials") is False
+def test_crypto_is_denied():
+    assert llm_allowed_for("Crypto") is False
+
+
+def test_financials_is_allowed():
+    # Financials is dominated by IPO/CEO speculation — knowledge questions
+    # where LLM-with-web-search performs reasonably. Not denied.
+    assert llm_allowed_for("Financials") is True
 
 
 def test_other_categories_allowed():
@@ -21,8 +27,7 @@ def test_other_categories_allowed():
 
 
 def test_denied_set_is_explicit():
-    # Catches accidental edits to the denylist.
-    assert LLM_DENIED_CATEGORIES == frozenset({"Climate and Weather", "Financials"})
+    assert LLM_DENIED_CATEGORIES == frozenset({"Climate and Weather", "Crypto"})
 
 
 def test_category_prior_returns_none_by_default():
@@ -48,8 +53,8 @@ def test_predict_skips_llm_for_denied_category():
     from agent.predict import predict
 
     with patch("agent.predict.get_market", return_value=None), patch(
-        "agent.predict.llm_forecast"
-    ) as llm_mock:
+        "agent.predict.category_prior", return_value=None
+    ), patch("agent.predict.llm_forecast") as llm_mock:
         out = predict(_event("Climate and Weather"))
     assert out["p_yes"] == 0.5
     assert "LLM gated" in out["rationale"]

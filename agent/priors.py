@@ -20,11 +20,16 @@ from __future__ import annotations
 # 2026-05-14 backtest (n=117, 95% Climate and Weather): LLM-enabled Brier 0.282
 # vs LLM-disabled 0.245. The miss was concentrated in p ∈ [0.2, 0.5]: LLM
 # under-predicted YES by 30-50 percentage points because it reasons from base
-# rates without current weather/market data.
+# rates without current weather/market data. Same dynamic expected for live
+# crypto price markets — these need a live spot quote, not LLM speculation.
+#
+# Note: "Financials" is NOT on the denylist — that category is dominated by
+# IPO/CEO-succession markets, which are knowledge/news questions where the
+# LLM with web search performs reasonably.
 LLM_DENIED_CATEGORIES = frozenset(
     {
         "Climate and Weather",
-        "Financials",
+        "Crypto",
     }
 )
 
@@ -45,4 +50,8 @@ def category_prior(event: dict) -> tuple[float, str] | None:
         from agent.weather import weather_prior
 
         return weather_prior(event)
+    if category == "Crypto":
+        from agent.financials import crypto_prior
+
+        return crypto_prior(event)
     return None
