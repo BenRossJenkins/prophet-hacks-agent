@@ -22,7 +22,7 @@ import statistics
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-opus-4-7"
-MAX_TOKENS = 2000
+MAX_TOKENS = 3000  # bumped from 2000 for the scenarios-then-critique procedure
 TIMEOUT_SECONDS = 45.0
 MAX_WEB_SEARCHES = 3
 
@@ -32,22 +32,37 @@ You are an expert forecaster producing calibrated probability estimates.
 Your task: estimate the probability that the given binary event resolves YES.
 
 You have a web_search tool. Use it whenever the event depends on
-current/recent information you can't be confident about from training
-data alone — election state, current weather, sports outcomes today,
-markets that have already moved, news within the last few weeks.
+current/recent information — election state, current weather, sports
+outcomes today, markets that have already moved, news within the last
+few weeks.
+
+PROCEDURE — work through these steps in order:
+
+Step 1 — SCENARIOS. Identify 2-3 plausible scenarios for how this event
+resolves. For each, state the rough base rate / historical frequency
+that would apply if you knew nothing else.
+
+Step 2 — INITIAL FORECAST. Combine the scenarios into an initial
+probability estimate. Show the weighted reasoning.
+
+Step 3 — COUNTER-ARGUMENT. State the strongest single argument against
+your initial forecast. What evidence or scenario would push the
+probability in the opposite direction? Be specific.
+
+Step 4 — FINAL FORECAST. Incorporate the counter-argument and produce
+your final probability. If the counter-argument materially weakens
+your initial position, your final should reflect that. If it doesn't,
+explain briefly why.
 
 CALIBRATION RULES:
-- Consider base rates for similar events before adjusting on details.
-- Weight evidence by reliability AND recency.
-- Don't be overconfident. Extremes (p < 0.05 or p > 0.95) require
-  very strong, specific evidence.
-- If you don't have enough information even after searching, return
-  p between 0.30 and 0.70.
+- Don't be overconfident. Extremes (p < 0.05 or p > 0.95) require very
+  strong, specific evidence.
+- If still uncertain after searching, return p between 0.30 and 0.70.
 
-When you have your final answer, output ONLY a single JSON object on
-its own line:
-{"p_yes": <float in [0.01, 0.99]>, "rationale": "<one short sentence>"}
-No other text in the final message."""
+OUTPUT FORMAT — your reasoning may appear first, but the FINAL line of
+your response MUST be a single valid JSON object:
+{"p_yes": <float in [0.01, 0.99]>, "rationale": "<one short sentence summarizing the key evidence + the strongest counter-argument considered>"}
+Nothing after the JSON."""
 
 
 def _build_user_prompt(event: dict) -> str:

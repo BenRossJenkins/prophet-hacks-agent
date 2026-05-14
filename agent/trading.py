@@ -38,11 +38,17 @@ MAX_PER_CATEGORY = 0.25       # cap exposure per category at 25% of bankroll
 
 # Confidence-based Kelly scaling. Multiplied with KELLY_FRACTION above.
 # Tradeable confidences: typed prior beats grounded LLM beats speculative LLM.
+#
+# 2026-05-14: bumped "high" from 1.0 → 2.0 (i.e. 0.5x full Kelly instead of
+# 0.25x) to be more aggressive when our typed external-data priors fire.
+# "medium" bumped 0.5 → 1.0 to preserve the 0.5x relative scaling. The
+# starting-bankroll-fraction cap (MAX_PER_MARKET=5%) still limits per-bet
+# exposure so we can't blow up on a single decision.
 KELLY_BY_CONFIDENCE = {
-    "high": 1.0,        # full configured fraction (1/4 Kelly)
-    "medium": 0.5,      # half — LLM with web search but no typed prior
-    "low": 0.0,         # don't trade on speculative LLM
-    "none": 0.0,        # never
+    "high": 2.0,        # typed prior — 0.5x full Kelly
+    "medium": 1.0,      # grounded LLM — 0.25x full Kelly
+    "low": 0.0,         # speculative LLM — don't trade
+    "none": 0.0,        # no signal — never
 }
 
 # ---- Decision dataclass --------------------------------------------------
@@ -282,9 +288,15 @@ class PositionBook:
         if price <= 0.0 or price >= 1.0:
             return None
 
-        # Bankroll basis: by default the starting bankroll (matches the size
-        # contract). Caller can override for dynamic-bankroll strategies.
-        basis = bankroll_override if bankroll_override is not None else self.starting_bankroll
+        # Compounding bankroll basis: starting capital plus realized P&L.
+        # Open positions are still tracked separately (their cost basis sits
+        # in cash already) so this represents capital ALLOCATABLE to new
+        # bets. Caller can override for fixed-bankroll backtests or stress
+        # tests.
+        if bankroll_override is not None:
+            basis = bankroll_override
+        else:
+            basis = max(0.0, self.starting_bankroll + self.realized_pnl)
         desired_cost = basis * decision.size_fraction
 
         # Apply per-market cap

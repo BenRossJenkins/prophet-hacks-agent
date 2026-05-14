@@ -71,21 +71,26 @@ def test_kelly_grows_as_edge_grows():
 
 
 def test_sized_fraction_applies_fractional_kelly_and_market_cap():
-    # full Kelly 0.40 → 0.25 * 1.0 (high) * 0.40 = 0.10, capped at MAX_PER_MARKET=0.05
+    # Large edge → caps at MAX_PER_MARKET regardless of confidence multiplier
     s = sized_fraction(0.70, 0.50, confidence="high")
     assert s == pytest.approx(MAX_PER_MARKET)
 
 
-def test_sized_fraction_below_cap_high_confidence():
-    # Small edge: p=0.52, price=0.50 → full Kelly 0.04 → high: 0.25 * 0.04 = 0.01
-    s = sized_fraction(0.52, 0.50, confidence="high")
-    assert s == pytest.approx(KELLY_FRACTION * 0.04)
+def test_sized_fraction_high_confidence_below_cap():
+    # Pick a small edge so the cap doesn't bind: p=0.18, price=0.10
+    # full Kelly = 0.08/0.90 ≈ 0.0889
+    # high multiplier 2.0 → 0.25 * 2.0 * 0.0889 = 0.0444 (under 0.05 cap)
+    s = sized_fraction(0.18, 0.10, confidence="high")
+    expected = 0.25 * 2.0 * (0.08 / 0.90)
+    assert s == pytest.approx(expected)
 
 
-def test_sized_fraction_medium_confidence_halves_position():
-    s_high = sized_fraction(0.55, 0.50, confidence="high")
-    s_med = sized_fraction(0.55, 0.50, confidence="medium")
+def test_sized_fraction_medium_halves_high():
+    # Same edge configuration; both should be under cap, ratio 0.5
+    s_high = sized_fraction(0.18, 0.10, confidence="high")
+    s_med = sized_fraction(0.18, 0.10, confidence="medium")
     assert s_med == pytest.approx(s_high * 0.5)
+    assert s_med < MAX_PER_MARKET  # confirms neither hit the cap
 
 
 def test_sized_fraction_low_confidence_is_zero():
@@ -156,12 +161,13 @@ def test_hold_when_confidence_is_low():
 
 
 def test_medium_confidence_halves_position():
-    # Use small-enough edge that the position-size cap doesn't bind:
-    # our_p=0.42, ask=0.32 → edge=0.10, full Kelly ≈ 0.147 → high sizing 0.0368, well
-    # under the 0.05 per-market cap.
-    market = _market(yes_bid=0.30, yes_ask=0.32)
-    p_h, _ = _mocks(our_p=0.42, market=market, confidence="high")
-    p_m, _ = _mocks(our_p=0.42, market=market, confidence="medium")
+    # Use a small-edge low-price trade so the cap doesn't bind under either
+    # confidence: p=0.14, ask=0.05 → edge 0.09 (> 0.08 threshold),
+    # full Kelly ≈ 0.0947. With high mult 2.0 → 0.0473 (under 0.05 cap);
+    # with medium mult 1.0 → 0.0237.
+    market = _market(yes_bid=0.04, yes_ask=0.05)
+    p_h, _ = _mocks(our_p=0.14, market=market, confidence="high")
+    p_m, _ = _mocks(our_p=0.14, market=market, confidence="medium")
     with p_h:
         with patch("agent.trading.get_market", return_value=market):
             d_high = decide(_event())
@@ -171,6 +177,7 @@ def test_medium_confidence_halves_position():
     assert d_high.action == "buy_yes"
     assert d_med.action == "buy_yes"
     assert d_med.size_fraction == pytest.approx(d_high.size_fraction * 0.5)
+    assert d_high.size_fraction < MAX_PER_MARKET
 
 
 def test_just_above_threshold_triggers_buy():
