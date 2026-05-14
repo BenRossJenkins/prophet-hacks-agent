@@ -1,0 +1,39 @@
+# Don't ship dev artifacts to Cloud Run.
+.git/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Local secrets — keys go in env vars at deploy time, never in image.
+.env
+.env.*
+!.env.example
+
+# Local data and machine-specific state
+data/
+tests/fixtures/live_snapshots.jsonl
+tests/fixtures/resolved_markets_live.jsonl
+
+# Reference clones and notebooks
+reference/
+notebooks/
+
+# Test code — we run pytest in CI, not in the image
+tests/
+
+# Local dev scripts — most aren't needed at runtime. Pull in selectively
+# later if we deploy a separate job for resolve/analyze.
+scripts/
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+.claude/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/

@@ -29,6 +29,7 @@ htmlcov/
 .env
 .env.*
 !.env.example
+cloudrun-env.yaml
 
 # Local data / artifacts
 *.db
