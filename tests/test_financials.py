@@ -148,3 +148,46 @@ def test_crypto_prior_returns_none_when_yfinance_fails():
 def test_crypto_prior_returns_none_when_past_deadline():
     with patch("agent.financials._spot_and_vol", return_value=(95000.0, 0.30)):
         assert crypto_prior(_event(close_in_hours=-1)) is None
+
+
+def test_crypto_prior_uses_intraday_vol_for_short_horizons():
+    """When close is within 24h, vol query asks for intraday data."""
+    captured = {}
+
+    def fake_spot(symbol, *, horizon_hours):
+        captured["horizon"] = horizon_hours
+        captured["symbol"] = symbol
+        return (95000.0, 0.40)
+
+    with patch("agent.financials._spot_and_vol", side_effect=fake_spot):
+        crypto_prior(_event(close_in_hours=2))
+
+    assert captured["horizon"] == pytest.approx(2.0, abs=0.05)
+    assert captured["symbol"] == "BTC-USD"
+
+
+def test_crypto_prior_uses_daily_vol_for_long_horizons():
+    captured = {}
+
+    def fake_spot(symbol, *, horizon_hours):
+        captured["horizon"] = horizon_hours
+        return (95000.0, 0.30)
+
+    with patch("agent.financials._spot_and_vol", side_effect=fake_spot):
+        crypto_prior(_event(close_in_hours=72))  # 3 days
+
+    assert captured["horizon"] == pytest.approx(72.0, abs=0.05)
+
+
+def test_crypto_prior_rationale_notes_vol_basis():
+    with patch("agent.financials._spot_and_vol", return_value=(95000.0, 0.40)):
+        out = crypto_prior(_event(close_in_hours=2))
+    assert out is not None
+    _, rationale = out
+    assert "intraday" in rationale
+
+    with patch("agent.financials._spot_and_vol", return_value=(95000.0, 0.30)):
+        out = crypto_prior(_event(close_in_hours=72))
+    assert out is not None
+    _, rationale = out
+    assert "daily" in rationale

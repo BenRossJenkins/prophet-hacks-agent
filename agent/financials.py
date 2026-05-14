@@ -25,6 +25,12 @@ logger = logging.getLogger(__name__)
 # yfinance is heavy; lazy-import inside _spot_price.
 _DEFAULT_ANN_VOL = 0.50  # annualized vol fallback if history unavailable
 
+# Short-horizon volatility is meaningfully larger than what daily-close
+# returns capture, especially for crypto. When the market closes within
+# this many hours, switch the vol estimator to hourly intraday returns.
+_INTRADAY_VOL_THRESHOLD_HOURS = 24.0
+_MIN_ANN_VOL = 0.20   # floor — never report a wildly tight distribution
+
 # Map event_ticker prefix → yfinance symbol.
 _ASSET_MAP = {
     "KXBTC": "BTC-USD",
@@ -112,23 +118,39 @@ def lognormal_p(spot: float, strike: float, sigma_ann: float, t_years: float) ->
     return 1.0 - _norm_cdf(z)
 
 
-_yf_cache: dict[str, tuple[float, float]] = {}
+_yf_cache: dict[tuple[str, str], tuple[float, float]] = {}
 
 
-def _spot_and_vol(symbol: str) -> tuple[float, float] | None:
+def _spot_and_vol(
+    symbol: str, *, horizon_hours: float | None = None
+) -> tuple[float, float] | None:
     """Return (current_price, annualized_vol) for a yfinance symbol.
 
-    Cached per process; the cache is fine for one prediction round but you'd
-    want to expire it in a long-running server (TTL ~60s).
+    `horizon_hours`: if < `_INTRADAY_VOL_THRESHOLD_HOURS`, estimate vol from
+    hourly intraday returns over the past 7 days (these are typically 2-3×
+    the vol implied by daily-close returns and more representative of what
+    will move price before close).
+
+    Cached per (symbol, frequency) pair.
     """
-    if symbol in _yf_cache:
-        return _yf_cache[symbol]
+    use_intraday = (
+        horizon_hours is not None and horizon_hours < _INTRADAY_VOL_THRESHOLD_HOURS
+    )
+    cache_key = (symbol, "intraday" if use_intraday else "daily")
+    if cache_key in _yf_cache:
+        return _yf_cache[cache_key]
 
     try:
         import yfinance as yf  # lazy import
 
         ticker = yf.Ticker(symbol)
-        hist = ticker.history(period="30d", interval="1d")
+        if use_intraday:
+            hist = ticker.history(period="7d", interval="1h")
+            periods_per_year = 24 * 365  # crypto trades 24/7
+        else:
+            hist = ticker.history(period="30d", interval="1d")
+            periods_per_year = 365
+
         if hist.empty:
             return None
         closes = hist["Close"]
@@ -139,12 +161,14 @@ def _spot_and_vol(symbol: str) -> tuple[float, float] | None:
             import numpy as np
 
             log_ret = np.log(closes / closes.shift(1)).dropna()
-            sigma_ann = float(log_ret.std() * math.sqrt(365)) or _DEFAULT_ANN_VOL
+            sigma_ann = float(log_ret.std() * math.sqrt(periods_per_year)) or _DEFAULT_ANN_VOL
+
+        sigma_ann = max(_MIN_ANN_VOL, sigma_ann)
     except Exception as e:  # very broad — yfinance has many failure modes
         logger.warning("yfinance fetch failed for %s: %s", symbol, e)
         return None
 
-    _yf_cache[symbol] = (spot, sigma_ann)
+    _yf_cache[cache_key] = (spot, sigma_ann)
     return spot, sigma_ann
 
 
@@ -154,22 +178,24 @@ def crypto_prior(event: dict) -> tuple[float, str] | None:
     if parsed is None:
         return None
 
-    sv = _spot_and_vol(parsed["asset"])
-    if sv is None:
-        return None
-    spot, sigma_ann = sv
-
     now_utc = datetime.now(UTC)
     t_seconds = (parsed["deadline_utc"] - now_utc).total_seconds()
     if t_seconds <= 0:
         return None
+    horizon_hours = t_seconds / 3600.0
     t_years = t_seconds / (365 * 24 * 3600)
+
+    sv = _spot_and_vol(parsed["asset"], horizon_hours=horizon_hours)
+    if sv is None:
+        return None
+    spot, sigma_ann = sv
 
     p_above = lognormal_p(spot, parsed["threshold"], sigma_ann, t_years)
     p_yes = p_above if parsed["comparison"] == "above" else (1.0 - p_above)
+    vol_basis = "intraday" if horizon_hours < _INTRADAY_VOL_THRESHOLD_HOURS else "daily"
     rationale = (
-        f"yfinance spot {parsed['asset']}=${spot:,.0f}, σ_ann={sigma_ann:.2f}, "
-        f"t={t_seconds / 3600:.1f}h to deadline; threshold ${parsed['threshold']:,.2f} "
+        f"yfinance spot {parsed['asset']}=${spot:,.0f}, σ_ann={sigma_ann:.2f} ({vol_basis}), "
+        f"t={horizon_hours:.1f}h to deadline; threshold ${parsed['threshold']:,.2f} "
         f"({parsed['comparison']}) → p_above={p_above:.3f}"
     )
     return p_yes, rationale

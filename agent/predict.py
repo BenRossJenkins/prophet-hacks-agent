@@ -43,13 +43,19 @@ class PredictionResponse(BaseModel):
 
 
 # Liquidity gates
-MIN_VOL_24H = 50.0    # USD — below this the book is noise
+MIN_VOL_24H = 10.0    # USD — below this the book is noise.
+                      # Lowered from 50 → 10 after parameter sweep
+                      # (scripts/sweep_params.py) showed -0.015 Brier on
+                      # the candlestick fixture (2026-05-14): markets with
+                      # $10-50 24h vol still carry useful price signal.
 MAX_SPREAD = 0.20     # dollars — wider and the midprice is uninformative
 NO_ARB_TOL = 0.02     # |yes_ask + no_ask − 1| > this → book broken
 
-# Shrinkage curve: alpha = scale / (vol + scale), clipped to [MIN, MAX]
+# Shrinkage curve: alpha = scale / (vol + scale), clipped to [MIN, MAX].
+# MAX dropped 0.10 → 0.05 after sweep (marginal but consistent gain;
+# protects high-confidence markets from over-pull toward 0.5).
 MIN_SHRINK_ALPHA = 0.005
-MAX_SHRINK_ALPHA = 0.10
+MAX_SHRINK_ALPHA = 0.05
 ALPHA_VOL_SCALE = 200.0
 
 # Staleness — currently dormant; see _staleness_hours docstring.

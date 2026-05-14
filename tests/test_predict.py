@@ -55,9 +55,10 @@ def test_clamp_engages_only_on_out_of_band_input():
 
 
 def test_shrink_alpha_decreases_with_volume():
-    a_low = _shrink_alpha(100.0)
-    a_med = _shrink_alpha(2_000.0)
-    a_high = _shrink_alpha(100_000.0)
+    # Pick volumes that land in the monotonic region (between MAX clamp and MIN clamp).
+    a_low = _shrink_alpha(5_000.0)
+    a_med = _shrink_alpha(20_000.0)
+    a_high = _shrink_alpha(200_000.0)
     assert a_low > a_med > a_high
 
 
