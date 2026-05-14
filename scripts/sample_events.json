@@ -1,0 +1,22 @@
+[
+  {
+    "event_ticker": "DEMO-RAIN",
+    "market_ticker": "DEMO-RAIN-YES",
+    "title": "Will it rain in Chicago on 2026-05-16?",
+    "subtitle": null,
+    "description": "Resolves YES if NWS reports >0.01 inches at ORD on 2026-05-16.",
+    "category": "Weather",
+    "rules": "Per NWS daily summary for ORD.",
+    "close_time": "2026-05-16T23:59:59+00:00"
+  },
+  {
+    "event_ticker": "DEMO-SP500",
+    "market_ticker": "DEMO-SP500-UP",
+    "title": "Will the S&P 500 close higher on 2026-05-16?",
+    "subtitle": null,
+    "description": "YES if SPX close > previous close.",
+    "category": "Markets",
+    "rules": "Per Yahoo Finance closing print.",
+    "close_time": "2026-05-16T20:00:00+00:00"
+  }
+]

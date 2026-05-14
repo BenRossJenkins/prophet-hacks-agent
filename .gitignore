@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+env/
+
+# Packaging/build
+build/
+dist/
+*.egg
+*.egg-info/
+.eggs/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Local data / artifacts
+*.db
+events.json
+submission.json
+actuals.json
+data/
+out/
+
+# Upstream reference clone (not part of our submission)
+reference/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
