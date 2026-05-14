@@ -38,7 +38,11 @@ def category_prior(event: dict) -> tuple[float, str] | None:
     """Look up an external-data prior for this event's category.
 
     Returns (p_yes, rationale) on success, or None to delegate to the LLM
-    fallback / uniform prior. Phase 4 will populate weather and financials
-    handlers here.
+    fallback / uniform prior.
     """
+    category = event.get("category", "")
+    if category == "Climate and Weather":
+        from agent.weather import weather_prior
+
+        return weather_prior(event)
     return None
