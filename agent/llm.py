@@ -311,21 +311,22 @@ def llm_forecast(
     return None
 
 
-# Production ensemble: 1 Anthropic (extended-thinking) + 1 OpenAI.
+# Production ensemble: 1 Anthropic (extended-thinking) + 1 OpenAI + 1 Google.
 #
-# Trimmed 2026-05-14 from 3 -> 2 members to give headroom under the
-# server's 30s per-event timeout. The remaining members cover two
-# vendors (Anthropic + OpenAI) so error decorrelation is preserved;
-# we lose the median's tiebreaker property at N=2, but median == mean
-# is fine for two well-calibrated members.
+# Cross-vendor: Anthropic decorrelated from OpenAI decorrelated from Google.
+# At N=3 the median is a real tiebreaker (not just an average), which is
+# what makes ensembles meaningfully better than single calls.
 #
-# Re-add models here if/when latency margins allow:
-#   - "claude-sonnet-4-6": faster Anthropic for a 3-way median
-#   - "gemini-2.5-flash": third vendor (requires paid Gemini billing;
-#     free tier blew its quota in backtest)
+# Currently pinned to gemini-2.5-flash because the current Gemini API key
+# is on a free-tier-only project. To upgrade to gemini-3-pro-preview
+# (latest flagship): enable paid billing on the API key's GCP project at
+# https://aistudio.google.com/app/apikey, OR generate a new key under the
+# prophet-hacks-2026 GCP project (which already has billing), then swap
+# the model string below.
 ENSEMBLE_MODELS = (
     "claude-opus-4-7-thinking",
     "gpt-5-mini",
+    "gemini-2.5-flash",
 )
 
 
