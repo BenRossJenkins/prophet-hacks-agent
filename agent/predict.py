@@ -265,6 +265,13 @@ async def predict_endpoint(event: EventRequest) -> PredictionResponse:
     return _forecast(event)
 
 
+@app.post("/trade")
+async def trade_endpoint(event: EventRequest) -> dict:
+    from agent.trading import decide
+
+    return decide(event.model_dump()).to_dict()
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
