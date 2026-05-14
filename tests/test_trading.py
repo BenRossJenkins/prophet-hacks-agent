@@ -41,9 +41,12 @@ def _market(yes_bid: float, yes_ask: float, *, no_bid: float | None = None, no_a
     }
 
 
-def _mocks(our_p: float, market: dict | None):
+def _mocks(our_p: float, market: dict | None, *, confidence: str = "high"):
     return (
-        patch("agent.trading.predict", return_value={"p_yes": our_p, "rationale": "test forecast"}),
+        patch(
+            "agent.trading.independent_forecast",
+            return_value=(our_p, "test forecast", confidence),
+        ),
         patch("agent.trading.get_market", return_value=market),
     )
 
@@ -68,15 +71,26 @@ def test_kelly_grows_as_edge_grows():
 
 
 def test_sized_fraction_applies_fractional_kelly_and_market_cap():
-    # full Kelly 0.40 → fractional 0.25 * 0.40 = 0.10, capped at MAX_PER_MARKET=0.05
-    s = sized_fraction(0.70, 0.50)
+    # full Kelly 0.40 → 0.25 * 1.0 (high) * 0.40 = 0.10, capped at MAX_PER_MARKET=0.05
+    s = sized_fraction(0.70, 0.50, confidence="high")
     assert s == pytest.approx(MAX_PER_MARKET)
 
 
-def test_sized_fraction_below_cap():
-    # Small edge: p=0.52, price=0.50 → full Kelly 0.04 → fractional 0.01 (below cap)
-    s = sized_fraction(0.52, 0.50)
+def test_sized_fraction_below_cap_high_confidence():
+    # Small edge: p=0.52, price=0.50 → full Kelly 0.04 → high: 0.25 * 0.04 = 0.01
+    s = sized_fraction(0.52, 0.50, confidence="high")
     assert s == pytest.approx(KELLY_FRACTION * 0.04)
+
+
+def test_sized_fraction_medium_confidence_halves_position():
+    s_high = sized_fraction(0.55, 0.50, confidence="high")
+    s_med = sized_fraction(0.55, 0.50, confidence="medium")
+    assert s_med == pytest.approx(s_high * 0.5)
+
+
+def test_sized_fraction_low_confidence_is_zero():
+    assert sized_fraction(0.95, 0.50, confidence="low") == 0
+    assert sized_fraction(0.95, 0.50, confidence="none") == 0
 
 
 # ---- decide() ------------------------------------------------------------
@@ -103,7 +117,8 @@ def test_buy_no_when_our_p_well_below_bid():
 
 def test_hold_when_edge_below_threshold():
     market = _market(yes_bid=0.49, yes_ask=0.51)
-    p1, p2 = _mocks(our_p=0.52, market=market)
+    # our_p=0.55 → edge_buy_yes = 0.04 (below 0.08 threshold) → hold
+    p1, p2 = _mocks(our_p=0.55, market=market, confidence="high")
     with p1, p2:
         d = decide(_event())
     assert d.action == "hold"
@@ -118,38 +133,50 @@ def test_hold_when_kalshi_unavailable():
     assert "kalshi unavailable" in d.rationale
 
 
-def test_hold_when_forecast_is_no_signal_fallback():
-    """If the agent fell back to 0.5 because it had no info, the trader must
-    refuse to trade — the market price is a better estimator and any apparent
-    edge is illusory.
-    """
+def test_hold_when_confidence_is_none():
+    """No-signal fallbacks (uniform prior, gated category) come through as
+    confidence='none'; the trader must hold."""
     market = _market(yes_bid=0.40, yes_ask=0.42)
-    no_signal_rationale = (
-        "no price signal (bid=0.000/ask=0.000/last=0.000); LLM unavailable; uniform prior"
-    )
-    with patch(
-        "agent.trading.predict",
-        return_value={"p_yes": 0.5, "rationale": no_signal_rationale},
-    ), patch("agent.trading.get_market", return_value=market):
+    p1, p2 = _mocks(our_p=0.5, market=market, confidence="none")
+    with p1, p2:
         d = decide(_event())
     assert d.action == "hold"
-    assert "no-signal" in d.rationale
+    assert "confidence=none" in d.rationale
 
 
-def test_hold_when_category_gated_uniform_prior():
-    market = _market(yes_bid=0.40, yes_ask=0.42)
-    gated_rationale = "no price signal; LLM gated for category='Climate and Weather'; uniform prior"
-    with patch(
-        "agent.trading.predict",
-        return_value={"p_yes": 0.5, "rationale": gated_rationale},
-    ), patch("agent.trading.get_market", return_value=market):
+def test_hold_when_confidence_is_low():
+    """Speculative LLM forecasts (no grounding markers) get confidence='low'
+    and are held."""
+    market = _market(yes_bid=0.30, yes_ask=0.32)
+    p1, p2 = _mocks(our_p=0.70, market=market, confidence="low")
+    with p1, p2:
         d = decide(_event())
     assert d.action == "hold"
+    assert "confidence=low" in d.rationale
+
+
+def test_medium_confidence_halves_position():
+    # Use small-enough edge that the position-size cap doesn't bind:
+    # our_p=0.42, ask=0.32 → edge=0.10, full Kelly ≈ 0.147 → high sizing 0.0368, well
+    # under the 0.05 per-market cap.
+    market = _market(yes_bid=0.30, yes_ask=0.32)
+    p_h, _ = _mocks(our_p=0.42, market=market, confidence="high")
+    p_m, _ = _mocks(our_p=0.42, market=market, confidence="medium")
+    with p_h:
+        with patch("agent.trading.get_market", return_value=market):
+            d_high = decide(_event())
+    with p_m:
+        with patch("agent.trading.get_market", return_value=market):
+            d_med = decide(_event())
+    assert d_high.action == "buy_yes"
+    assert d_med.action == "buy_yes"
+    assert d_med.size_fraction == pytest.approx(d_high.size_fraction * 0.5)
 
 
 def test_just_above_threshold_triggers_buy():
     market = _market(yes_bid=0.40, yes_ask=0.45)
-    p1, p2 = _mocks(our_p=0.51, market=market)
+    # our_p=0.55 → edge=0.10, above 0.08 threshold
+    p1, p2 = _mocks(our_p=0.55, market=market, confidence="high")
     with p1, p2:
         d = decide(_event())
     assert d.action == "buy_yes"

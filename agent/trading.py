@@ -24,26 +24,26 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Iterable
 
+from agent.independent import independent_forecast
 from agent.kalshi import get_market
-from agent.predict import predict
 
 # ---- Sizing constants ----------------------------------------------------
 
-EDGE_THRESHOLD = 0.05         # don't trade unless edge >= 5pp
+EDGE_THRESHOLD = 0.08         # don't trade unless edge >= 8pp (wider than the
+                              # forecaster's 5pp; trading is leveraged so a
+                              # bigger edge floor is appropriate)
 KELLY_FRACTION = 0.25         # fractional Kelly — 1/4 Kelly is conservative-standard
 MAX_PER_MARKET = 0.05         # cap exposure per market at 5% of bankroll
 MAX_PER_CATEGORY = 0.25       # cap exposure per category at 25% of bankroll
 
-# Substrings in forecast.rationale that mean "we have no real signal here".
-# When any of these appear we refuse to trade — the market is a better
-# estimator than our uniform 0.5 fallback, so any apparent "edge" against
-# it is illusory.
-NO_SIGNAL_MARKERS = (
-    "uniform prior",
-    "LLM unavailable",
-    "LLM gated",
-    "kalshi fetch failed",
-)
+# Confidence-based Kelly scaling. Multiplied with KELLY_FRACTION above.
+# Tradeable confidences: typed prior beats grounded LLM beats speculative LLM.
+KELLY_BY_CONFIDENCE = {
+    "high": 1.0,        # full configured fraction (1/4 Kelly)
+    "medium": 0.5,      # half — LLM with web search but no typed prior
+    "low": 0.0,         # don't trade on speculative LLM
+    "none": 0.0,        # never
+}
 
 # ---- Decision dataclass --------------------------------------------------
 
@@ -84,10 +84,11 @@ def kelly_fraction(our_p: float, price: float) -> float:
     return edge / (1.0 - price)
 
 
-def sized_fraction(our_p: float, price: float) -> float:
-    """Position size as a bankroll fraction, fractional Kelly capped at MAX_PER_MARKET."""
+def sized_fraction(our_p: float, price: float, *, confidence: str = "high") -> float:
+    """Position size as a bankroll fraction, scaled by confidence."""
     full_kelly = kelly_fraction(our_p, price)
-    return min(KELLY_FRACTION * full_kelly, MAX_PER_MARKET)
+    confidence_mult = KELLY_BY_CONFIDENCE.get(confidence, 0.0)
+    return min(KELLY_FRACTION * confidence_mult * full_kelly, MAX_PER_MARKET)
 
 
 # ---- Decision -----------------------------------------------------------
@@ -125,18 +126,22 @@ def _build_hold(
 
 
 def decide(event: dict) -> TradeDecision:
-    """Make a single-market trading decision from an event dict."""
-    market_ticker = event.get("market_ticker", "")
-    forecast = predict(event)
-    our_p = float(forecast["p_yes"])
-    forecast_rationale = forecast["rationale"]
+    """Make a single-market trading decision from an event dict.
 
-    # If our forecast is a no-signal fallback, never trade against the market.
-    # The market price is a strictly better estimator than our 0.5 default.
-    if any(marker in forecast_rationale for marker in NO_SIGNAL_MARKERS):
+    Uses the independent forecast (priors / LLM ensemble — never market-
+    anchored) as our second opinion. We only trade when (1) the forecast
+    is confident enough to bet AND (2) it disagrees with the market by at
+    least EDGE_THRESHOLD.
+    """
+    market_ticker = event.get("market_ticker", "")
+    our_p, forecast_rationale, confidence = independent_forecast(event)
+
+    # No tradeable signal → hold. (Speculative LLM and total fallback both
+    # land here; we don't risk bankroll on guesses.)
+    if confidence not in ("high", "medium"):
         return _build_hold(
             market_ticker, our_p, 0.0, 0.0, 0.0, 0.0, 0.0,
-            rationale=f"hold: no-signal forecast (would just be betting against market); {forecast_rationale}",
+            rationale=f"hold: confidence={confidence}; {forecast_rationale}",
         )
 
     market = get_market(market_ticker)
@@ -157,7 +162,12 @@ def decide(event: dict) -> TradeDecision:
     edge_buy_no = (1.0 - our_p) - no_ask if no_ask > 0 else float("-inf")
 
     if edge_buy_yes >= EDGE_THRESHOLD and edge_buy_yes >= edge_buy_no:
-        size = sized_fraction(our_p, yes_ask)
+        size = sized_fraction(our_p, yes_ask, confidence=confidence)
+        if size <= 0:
+            return _build_hold(
+                market_ticker, our_p, yes_bid, yes_ask, no_bid, no_ask, edge_buy_yes,
+                rationale=f"hold: zero size at confidence={confidence}; {forecast_rationale}",
+            )
         return TradeDecision(
             market_ticker=market_ticker,
             action="buy_yes",
@@ -170,11 +180,16 @@ def decide(event: dict) -> TradeDecision:
             size_fraction=size,
             rationale=(
                 f"buy YES @ {yes_ask:.3f}: our_p={our_p:.3f}, edge={edge_buy_yes:.3f}, "
-                f"size={size:.3%}; {forecast_rationale}"
+                f"size={size:.3%}, confidence={confidence}; {forecast_rationale}"
             ),
         )
     if edge_buy_no >= EDGE_THRESHOLD:
-        size = sized_fraction(1.0 - our_p, no_ask)
+        size = sized_fraction(1.0 - our_p, no_ask, confidence=confidence)
+        if size <= 0:
+            return _build_hold(
+                market_ticker, our_p, yes_bid, yes_ask, no_bid, no_ask, edge_buy_no,
+                rationale=f"hold: zero size at confidence={confidence}; {forecast_rationale}",
+            )
         return TradeDecision(
             market_ticker=market_ticker,
             action="buy_no",
@@ -187,7 +202,7 @@ def decide(event: dict) -> TradeDecision:
             size_fraction=size,
             rationale=(
                 f"buy NO @ {no_ask:.3f}: 1-our_p={1 - our_p:.3f}, edge={edge_buy_no:.3f}, "
-                f"size={size:.3%}; {forecast_rationale}"
+                f"size={size:.3%}, confidence={confidence}; {forecast_rationale}"
             ),
         )
 

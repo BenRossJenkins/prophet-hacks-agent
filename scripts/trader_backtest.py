@@ -54,15 +54,24 @@ def run(entries: list[dict], *, with_llm: bool = False, starting_bankroll: float
     market_lookup = _market_lookup_factory(entries)
 
     if with_llm:
-        no_search_llm = functools.partial(llm_mod.llm_forecast, with_web_search=False)
-        llm_patch = patch("agent.predict.llm_forecast_ensemble", side_effect=no_search_llm)
+        # Web search would leak resolution info on settled markets. Use the
+        # ensemble in no-web-search mode so we measure training-cutoff
+        # knowledge only.
+        no_search_ensemble = functools.partial(
+            llm_mod.llm_forecast_ensemble, with_web_search=False
+        )
+        llm_patch_independent = patch(
+            "agent.independent.llm_forecast_ensemble", side_effect=no_search_ensemble
+        )
     else:
-        llm_patch = patch("agent.predict.llm_forecast_ensemble", return_value=None)
+        llm_patch_independent = patch(
+            "agent.independent.llm_forecast_ensemble", return_value=None
+        )
 
     decisions: list[dict] = []
     with patch("agent.trading.get_market", side_effect=market_lookup), patch(
         "agent.predict.get_market", side_effect=market_lookup
-    ), llm_patch:
+    ), llm_patch_independent:
         # First pass: collect decisions
         for entry in entries:
             event = entry["event"]
