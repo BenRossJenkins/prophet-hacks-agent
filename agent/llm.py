@@ -280,12 +280,17 @@ def llm_forecast(
     return None
 
 
-# Four-model cross-vendor ensemble: 2 Anthropic + 1 OpenAI + 1 Google.
+# Three-model cross-vendor production ensemble: 2 Anthropic + 1 OpenAI.
+#
+# Gemini was dropped from the default 2026-05-14 after the free-tier
+# quota (20 requests/day per model, 5 requests/min) blew up under
+# backtest load. To re-enable, upgrade the Gemini API to paid billing
+# and add "gemini-2.5-flash" back into this tuple. The dispatch logic
+# in _vendor_for / _gemini_forecast remains in place.
 ENSEMBLE_MODELS = (
     "claude-opus-4-7",
     "claude-sonnet-4-6",
     "gpt-5-mini",
-    "gemini-2.5-flash",
 )
 
 
