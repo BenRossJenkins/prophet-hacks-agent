@@ -44,9 +44,49 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_LOG_PATH = "data/predictions.jsonl"
 
+# Optional: when set to a `gs://bucket/prefix` URI, every prediction is
+# ALSO written as a per-event JSON object under that prefix. This makes
+# predictions durable across Cloud Run container restarts and lets the
+# daily calibration cron pull them back without needing FS access to the
+# running container. Object key is "<prefix>/<ts>_<market_ticker>.json".
+PREDICTION_LOG_GCS_PREFIX_ENV = "PREDICTION_LOG_GCS_PREFIX"
+
 
 def get_log_path() -> Path:
     return Path(os.environ.get("PREDICTION_LOG_PATH", DEFAULT_LOG_PATH))
+
+
+def _write_to_gcs(entry: dict[str, Any]) -> None:
+    """Write a single prediction entry to GCS as `<prefix>/<ts>_<ticker>.json`.
+
+    Never raises. Silently skips when PREDICTION_LOG_GCS_PREFIX isn't set,
+    when google-cloud-storage isn't importable, or on any network error.
+    """
+    prefix = os.environ.get(PREDICTION_LOG_GCS_PREFIX_ENV)
+    if not prefix or not prefix.startswith("gs://"):
+        return
+    try:
+        from google.cloud import storage  # lazy import
+
+        rest = prefix[len("gs://"):]
+        bucket_name, _, key_prefix = rest.partition("/")
+        if not bucket_name:
+            return
+        key_prefix = key_prefix.strip("/")
+        ts = entry.get("ts", "").replace(":", "-")
+        ticker = (entry.get("event") or {}).get("market_ticker", "unknown")
+        safe_ticker = ticker.replace("/", "_")
+        object_name = (
+            f"{key_prefix}/{ts}_{safe_ticker}.json" if key_prefix
+            else f"{ts}_{safe_ticker}.json"
+        )
+        client = storage.Client()
+        blob = client.bucket(bucket_name).blob(object_name)
+        blob.upload_from_string(
+            json.dumps(entry), content_type="application/json", timeout=10
+        )
+    except Exception as e:
+        logger.warning("GCS prediction-log write failed: %s", e)
 
 
 def classify_path(rationale: str) -> str:
@@ -114,3 +154,10 @@ def log_prediction(
             f.write(json.dumps(entry) + "\n")
     except Exception as e:
         logger.warning("prediction log write failed: %s", e)
+        return
+    # Best-effort GCS mirror so predictions survive Cloud Run restarts.
+    # Never blocks or breaks /predict; failures are logged and dropped.
+    try:
+        _write_to_gcs(entry)
+    except Exception as e:
+        logger.warning("prediction log GCS mirror failed: %s", e)

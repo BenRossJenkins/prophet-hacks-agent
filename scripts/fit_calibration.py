@@ -1,11 +1,12 @@
-"""Fit and save a calibration table from resolved predictions.
+"""Fit and save a path-stratified calibration table from resolved predictions.
 
 Run daily during the eval window:
   python scripts/resolve_predictions.py     # mark newly-resolved
-  python scripts/fit_calibration.py          # refit calibration
+  python scripts/fit_calibration.py         # refit calibration
 
 The live agent reads `data/calibration.json` on every predict() call
-(60s in-process cache) and applies it.
+(60s in-process cache) and applies it — per-path bucket first, falling
+back to global when path data is sparse.
 
 Usage:
   python scripts/fit_calibration.py [--input data/resolved_predictions.jsonl]
@@ -18,15 +19,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 from agent.calibrate import (
-    apply_calibration,
-    fit_calibration,
+    apply_calibration_data,
+    fit_calibration_by_path,
     get_calibration_path,
     save_calibration,
 )
+from agent.prediction_log import classify_path
+
+
+def _path_for_row(row: dict) -> str | None:
+    metadata = row.get("metadata")
+    if isinstance(metadata, dict):
+        p = metadata.get("path")
+        if isinstance(p, str) and p:
+            return p
+    rationale = row.get("rationale")
+    if isinstance(rationale, str) and rationale:
+        return classify_path(rationale)
+    return None
 
 
 def main() -> int:
@@ -75,24 +91,21 @@ def main() -> int:
         )
         return 2
 
-    table = fit_calibration(rows, n_bins=args.n_bins)
-    if not table:
+    payload = fit_calibration_by_path(rows, n_bins=args.n_bins)
+    if not payload.get("global"):
         print("Fit produced an empty table (all rows missing p_yes/result?).", file=sys.stderr)
         return 1
 
     out_path = args.output or get_calibration_path()
-    save_calibration(table, out_path)
+    save_calibration(payload, out_path)
     print(f"Calibration table → {out_path}")
 
-    # Optionally mirror to GCS for live-agent consumption (Cloud Run reads
-    # this with a 60s cache, so freshness is automatic).
-    import os
-    import subprocess
-
+    # Mirror to GCS so the deployed agent picks up the update without
+    # redeploy (60s in-process cache + GCS-preferred load).
     gcs_uri = os.environ.get("CALIBRATION_GCS_URI")
     if gcs_uri:
         try:
-            result = subprocess.run(
+            subprocess.run(
                 ["gcloud", "storage", "cp", str(out_path), gcs_uri, "--quiet"],
                 check=True,
                 capture_output=True,
@@ -102,8 +115,28 @@ def main() -> int:
             print(f"  mirrored to {gcs_uri}")
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             print(f"  GCS upload failed (ignored): {e}", file=sys.stderr)
+
+    # Per-path summary first (this is the interesting one for analysis).
+    by_path = payload.get("by_path") or {}
+    if by_path:
+        print("\n=== Per-path tables ===")
+        for path_label in sorted(by_path):
+            table = by_path[path_label]
+            n_total = sum(b["n"] for b in table)
+            print(f"\n[{path_label}] n={n_total} across {len(table)} buckets:")
+            for b in table:
+                bias = b["mean_actual"] - b["mean_p"]
+                flag = "  ← BIAS" if abs(bias) > 0.10 else ""
+                print(
+                    f"  [{b['bucket_lo']:.2f}-{b['bucket_hi']:.2f})"
+                    f"{b['n']:>5}{b['mean_p']:>9.3f}{b['mean_actual']:>13.3f}"
+                    f"{bias:>+8.3f}{flag}"
+                )
+
+    # Global summary.
+    print(f"\n=== Global (fallback) ===")
     print(f"{'Bucket':<14}{'N':>5}{'mean_p':>9}{'mean_actual':>13}{'bias':>9}")
-    for b in table:
+    for b in payload["global"]:
         bias = b["mean_actual"] - b["mean_p"]
         flag = "  ← BIAS" if abs(bias) > 0.10 else ""
         print(
@@ -112,31 +145,29 @@ def main() -> int:
             f"{bias:>+8.3f}{flag}"
         )
 
-    # Diagnostic: what change would calibration produce on the existing rows?
-    if rows:
-        n_changed = 0
-        total_brier_delta = 0.0
-        for r in rows:
-            try:
-                p = float(r.get("p_yes", 0.5))
-            except (ValueError, TypeError):
-                continue
-            result = r.get("result", "")
-            if result not in ("yes", "no"):
-                continue
-            actual = 1.0 if result == "yes" else 0.0
-            new_p = apply_calibration(p, table)
-            if abs(new_p - p) > 1e-6:
-                n_changed += 1
-                old_brier = (p - actual) ** 2
-                new_brier = (new_p - actual) ** 2
-                total_brier_delta += new_brier - old_brier
-        if n_changed:
-            print(
-                f"\nOn the training rows: {n_changed} predictions changed; "
-                f"in-sample Brier delta = {total_brier_delta:+.5f} "
-                f"(negative = improvement; this is in-sample so optimistic)"
-            )
+    # Diagnostic: in-sample Brier delta. Optimistic but useful for sanity.
+    n_changed = 0
+    total_brier_delta = 0.0
+    for r in rows:
+        try:
+            p_orig = float(r.get("p_yes", 0.5))
+        except (ValueError, TypeError):
+            continue
+        result = r.get("result", "")
+        if result not in ("yes", "no"):
+            continue
+        actual = 1.0 if result == "yes" else 0.0
+        row_path = _path_for_row(r)
+        new_p = apply_calibration_data(p_orig, payload, path=row_path)
+        if abs(new_p - p_orig) > 1e-6:
+            n_changed += 1
+            total_brier_delta += (new_p - actual) ** 2 - (p_orig - actual) ** 2
+    if n_changed:
+        print(
+            f"\nOn the training rows: {n_changed} predictions changed; "
+            f"in-sample Brier delta = {total_brier_delta:+.5f} "
+            f"(negative = improvement; this is in-sample so optimistic)"
+        )
     return 0
 
 
