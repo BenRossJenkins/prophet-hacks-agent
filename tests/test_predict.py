@@ -570,6 +570,106 @@ def test_predict_falls_through_when_kalshi_fails_and_poly_no_match():
     assert "LLM" in out["rationale"]
 
 
+# ---- Probabilities-only contract ---------------------------------------
+
+
+def test_predict_returns_probabilities_for_binary_event():
+    """Every response must include probabilities matching outcomes, summing to 1."""
+    e = _event()
+    e["outcomes"] = ["Pittsburgh", "Atlanta"]
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.category_prior", return_value=None
+    ), patch("agent.predict.llm_forecast_ensemble", return_value=(0.62, "research")):
+        out = predict(e)
+    assert "probabilities" in out
+    probs = out["probabilities"]
+    assert len(probs) == 2
+    markets = {p["market"] for p in probs}
+    assert markets == {"Pittsburgh", "Atlanta"}
+    total = sum(p["probability"] for p in probs)
+    assert total == pytest.approx(1.0)
+
+
+def test_predict_probabilities_match_outcomes_order():
+    """outcomes[0] should be the first entry in probabilities (or at least present)."""
+    e = _event()
+    e["outcomes"] = ["TeamA", "TeamB"]
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.category_prior", return_value=None
+    ), patch("agent.predict.llm_forecast_ensemble", return_value=(0.7, "rationale")):
+        out = predict(e)
+    by_market = {p["market"]: p["probability"] for p in out["probabilities"]}
+    # p_yes is for outcomes[0]; after shrink α=0.15 (speculative): 0.7*0.85 + 0.5*0.15 = 0.67
+    expected = 0.7 * 0.85 + 0.5 * 0.15
+    assert by_market["TeamA"] == pytest.approx(expected)
+    assert by_market["TeamB"] == pytest.approx(1.0 - expected)
+
+
+def test_predict_falls_back_to_yes_no_when_outcomes_missing():
+    """If event has no outcomes, default to ['Yes', 'No'] distribution."""
+    e = _event()
+    e.pop("outcomes", None)
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.category_prior", return_value=None
+    ), patch("agent.predict.llm_forecast_ensemble", return_value=(0.3, "x")):
+        out = predict(e)
+    markets = {p["market"] for p in out["probabilities"]}
+    assert markets == {"Yes", "No"}
+
+
+def test_predict_multi_outcome_distribution_sums_to_one():
+    """For multi-outcome events, the full distribution must sum to 1 strictly."""
+    e = _event()
+    e["outcomes"] = ["A", "B", "C", "D"]
+    e["title"] = "Who will win?"  # single-winner
+    with patch("agent.predict.get_market") as market_mock, patch(
+        "agent.predict.llm_forecast_ensemble_full",
+        return_value=(
+            0.4,
+            [
+                {"market": "A", "probability": 0.40},
+                {"market": "B", "probability": 0.30},
+                {"market": "C", "probability": 0.20},
+                {"market": "D", "probability": 0.10},
+            ],
+            "rat",
+        ),
+    ):
+        out = predict(e)
+    market_mock.assert_not_called()
+    total = sum(p["probability"] for p in out["probabilities"])
+    assert total == pytest.approx(1.0)
+
+
+def test_predict_multi_outcome_normalizes_summing_to_more_than_one():
+    """Top-K LLM outputs sum to K. We must normalize to 1."""
+    e = _event()
+    e["outcomes"] = [f"C{i}" for i in range(35)]
+    e["title"] = "top 5 finishers"
+    # LLM gives a top-5-style distribution that sums to ~5
+    raw_probs = [
+        {"market": f"C{i}", "probability": 0.20 if i < 25 else 0.0}
+        for i in range(35)
+    ]
+    with patch("agent.predict.llm_forecast_ensemble_full",
+               return_value=(0.20, raw_probs, "r")):
+        out = predict(e)
+    total = sum(p["probability"] for p in out["probabilities"])
+    assert total == pytest.approx(1.0)
+
+
+def test_predict_multi_outcome_uniform_when_llm_fails():
+    """Uniform 1/N distribution when the LLM can't be reached."""
+    e = _event()
+    e["outcomes"] = ["A", "B", "C", "D", "E"]
+    with patch("agent.predict.llm_forecast_ensemble_full", return_value=None):
+        out = predict(e)
+    probs = out["probabilities"]
+    assert len(probs) == 5
+    for p in probs:
+        assert p["probability"] == pytest.approx(0.2)
+
+
 def test_predict_output_always_in_contract_range():
     market = {
         "yes_bid_dollars": "0.99",

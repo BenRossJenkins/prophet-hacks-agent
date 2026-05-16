@@ -66,8 +66,18 @@ yfinance, LLM vendors) must degrade gracefully:
 - Ensemble: per-vendor failures dropped; median of survivors wins
 - `log_prediction` never raises (a failed log must not break `/predict`)
 
-**Output is sacred.** Always clamp `p_yes` to `[0.01, 0.99]` before
-returning; Pydantic 422s anything outside, which breaks the contract.
+**Output contract (2026-05-16 update).** The wire response is
+`{"probabilities": [{"market": <outcome>, "probability": <float>}, ...]}`.
+Probabilities MUST sum to 1.0 (strict, the server normalizes
+otherwise but we should be exact). Each `market` MUST match one of the
+event's `outcomes` exactly — typos = silent miss. `p_yes` and
+`rationale` are extra fields the server ignores but we keep for our
+own calibration / logging and CLI backwards-compat.
+
+The internal pipeline still computes a binary `p_yes` for outcomes[0]
+on 2-outcome events; the `_wrap_binary()` helper turns it into a
+2-element distribution. Multi-outcome events build the distribution
+directly from the LLM ensemble (with normalization to enforce sum=1).
 
 **Don't shrink prior outputs.** `agent/weather.py` (sigmoid bandwidth)
 and `agent/financials.py` (lognormal sigma) already model uncertainty

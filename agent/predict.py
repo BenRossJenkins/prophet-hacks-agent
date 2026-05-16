@@ -51,9 +51,21 @@ class MarketProbability(BaseModel):
 
 
 class PredictionResponse(BaseModel):
-    p_yes: float = Field(ge=0.01, le=0.99)
-    probabilities: list[MarketProbability] | None = None
-    rationale: str
+    """Server-facing response.
+
+    Per the Prophet Arena developer docs (2026-05-16): every prediction must
+    return `probabilities` as a list of {market, probability} entries that
+    cover every event outcome and sum to 1. The `p_yes` and `rationale`
+    fields are retained for internal use (calibration fitting, logging,
+    backwards compat with older CLI versions) but are NOT the contract.
+    """
+
+    probabilities: list[MarketProbability]
+    # Legacy convenience field — not required by the server, but the older
+    # ai-prophet CLI falls back to it and our calibration / log machinery
+    # still keys off a single binary probability for binary events.
+    p_yes: float | None = Field(default=None, ge=0.01, le=0.99)
+    rationale: str | None = None
 
 
 # Liquidity gates
@@ -112,6 +124,82 @@ _LLM_GROUNDED_MARKERS = (
     "polls",
     "polling",
 )
+
+
+def _default_outcomes(event: EventRequest) -> list[str]:
+    """Fall back to ['Yes', 'No'] when an event has no outcomes list.
+
+    Per the developer docs, every Event should arrive with an `outcomes`
+    field. This is a defensive fallback for malformed inputs / legacy
+    callers; do not rely on it.
+    """
+    if event.outcomes and len(event.outcomes) >= 2:
+        return list(event.outcomes)
+    return ["Yes", "No"]
+
+
+def _binary_distribution(p: float, outcomes: list[str]) -> list[MarketProbability]:
+    """Convert P(outcomes[0]) → 2-outcome distribution summing to 1."""
+    p = max(0.0, min(1.0, p))
+    return [
+        MarketProbability(market=outcomes[0], probability=p),
+        MarketProbability(market=outcomes[1], probability=1.0 - p),
+    ]
+
+
+def _normalize_distribution(
+    probs: list[dict] | list[MarketProbability], outcomes: list[str]
+) -> list[MarketProbability]:
+    """Align a probability list to `outcomes` order, fill missing, normalize to 1.0.
+
+    Ensures every event outcome has an entry, missing ones get the
+    uniform residual, then renormalize so probabilities sum to 1.0.
+    Critical: server rejects (or rather mis-scores) outputs whose
+    markets don't match event outcomes exactly.
+    """
+    by_market: dict[str, float] = {}
+    for entry in probs:
+        if isinstance(entry, MarketProbability):
+            market, prob = entry.market, entry.probability
+        else:
+            market = str(entry.get("market", ""))
+            try:
+                prob = float(entry.get("probability", 0.0))
+            except (ValueError, TypeError):
+                continue
+        if market in outcomes:
+            by_market[market] = max(0.0, prob)
+
+    missing = [o for o in outcomes if o not in by_market]
+    if missing:
+        covered_sum = sum(by_market.values())
+        residual = max(0.0, 1.0 - covered_sum)
+        per_missing = residual / len(missing) if missing else 0.0
+        for m in missing:
+            by_market[m] = per_missing
+
+    total = sum(by_market.get(o, 0.0) for o in outcomes)
+    if total <= 0:
+        # All zero — uniform fallback.
+        per = 1.0 / len(outcomes)
+        return [MarketProbability(market=o, probability=per) for o in outcomes]
+    return [
+        MarketProbability(market=o, probability=by_market[o] / total)
+        for o in outcomes
+    ]
+
+
+def _wrap_binary(
+    p: float, rationale: str, event: EventRequest
+) -> PredictionResponse:
+    """Build the response from an internal P(outcomes[0])."""
+    p_clamped = max(0.01, min(0.99, p))
+    outs = _default_outcomes(event)
+    return PredictionResponse(
+        probabilities=_binary_distribution(p_clamped, outs),
+        p_yes=p_clamped,
+        rationale=rationale,
+    )
 
 
 def _is_multi_outcome(event: EventRequest) -> bool:
@@ -369,26 +457,28 @@ def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
     if prior_out is not None:
         p, prior_rationale = prior_out
         p = max(0.01, min(0.99, p))
-        return PredictionResponse(p_yes=p, rationale=f"{reason}; prior: {prior_rationale}")
+        return _wrap_binary(p, f"{reason}; prior: {prior_rationale}", event)
 
     if not llm_allowed_for(event.category):
-        return PredictionResponse(
-            p_yes=0.5,
-            rationale=f"{reason}; LLM gated for category='{event.category}'; uniform prior",
+        return _wrap_binary(
+            0.5,
+            f"{reason}; LLM gated for category='{event.category}'; uniform prior",
+            event,
         )
 
     # Ensemble over multiple Claude variants; gracefully degrades to a single
     # call if some members fail.
     out = llm_forecast_ensemble(event_d)
     if out is None:
-        return PredictionResponse(p_yes=0.5, rationale=f"{reason}; LLM unavailable; uniform prior")
+        return _wrap_binary(0.5, f"{reason}; LLM unavailable; uniform prior", event)
     p_raw, llm_rationale = out
     alpha = _llm_shrink_alpha(llm_rationale)
     p = _shrink_and_clamp(p_raw, alpha=alpha)
     tier = "grounded" if alpha == LLM_SHRINK_GROUNDED else "speculative"
-    return PredictionResponse(
-        p_yes=p,
-        rationale=f"{reason}; LLM ({tier}, α={alpha}, raw={p_raw:.3f}): {llm_rationale}",
+    return _wrap_binary(
+        p,
+        f"{reason}; LLM ({tier}, α={alpha}, raw={p_raw:.3f}): {llm_rationale}",
+        event,
     )
 
 
@@ -397,48 +487,66 @@ def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
 
     The market-anchor / sportsbook / manifold tiers are all designed for 2-
     outcome binary questions, so they're skipped entirely. Go straight to
-    the LLM ensemble with explicit framing ('p_yes is P(outcomes[0] in
-    resolved set)'), aggregate per-outcome probabilities across vendors,
-    and shrink p_yes toward the k/N uniform prior.
+    the LLM ensemble with explicit framing, aggregate per-outcome
+    probabilities across vendors, and normalize the final distribution to
+    sum to 1 (server contract).
     """
     event_d = event.model_dump()
-    prior = _uniform_prior(event)
-    n_out = len(event.outcomes or [])
+    outcomes = event.outcomes or []
+    n_out = len(outcomes)
     k = _estimate_winners_count(event)
+    prior = _uniform_prior(event)
 
     out = llm_forecast_ensemble_full(event_d)
     if out is None:
+        # Uniform fallback. For top-K questions, every outcome is equally
+        # likely, so the distribution is just 1/N across outcomes (which
+        # would naively sum to 1 anyway — perfect).
+        uniform = [
+            MarketProbability(market=o, probability=1.0 / n_out)
+            for o in outcomes
+        ] if n_out > 0 else []
         return PredictionResponse(
+            probabilities=uniform,
             p_yes=max(0.01, min(0.99, prior)),
             rationale=(
                 f"multi-outcome ({n_out} options, top-{k}); LLM unavailable; "
-                f"uniform prior {prior:.3f}"
+                f"uniform 1/N across outcomes"
             ),
         )
     raw_p, probabilities, llm_rationale = out
 
-    # Shrink toward the uniform prior, not toward 0.5 — for a 35-option
-    # question, 0.5 is itself an absurd answer.
-    shrunk = (1 - MULTI_LLM_SHRINK) * raw_p + MULTI_LLM_SHRINK * prior
-    shrunk = max(0.01, min(0.99, shrunk))
-
-    probs_payload: list[MarketProbability] | None = None
+    # Build the per-outcome distribution. If the LLM gave us one, normalize
+    # it to sum to 1 (the LLM was instructed to sum to K for top-K, but the
+    # server contract is strict sum-to-1). If no distribution was provided,
+    # synthesize one from p_yes for outcomes[0] + uniform across the rest.
     if probabilities:
-        # Clamp each per-outcome probability to [0, 1] but DON'T renormalize:
-        # top-K questions have probabilities summing to ~K, not 1.
-        probs_payload = [
-            MarketProbability(
-                market=p["market"], probability=max(0.0, min(1.0, p["probability"]))
-            )
-            for p in probabilities
-        ]
+        dist = _normalize_distribution(probabilities, outcomes)
+    else:
+        # Shrink raw_p toward uniform prior k/N first (variance protection),
+        # then distribute the remaining mass uniformly across other outcomes.
+        shrunk = (1 - MULTI_LLM_SHRINK) * raw_p + MULTI_LLM_SHRINK * prior
+        shrunk = max(0.01, min(0.99, shrunk))
+        synthesized = [{"market": outcomes[0], "probability": shrunk}]
+        if n_out > 1:
+            per_other = (1.0 - shrunk) / (n_out - 1)
+            for o in outcomes[1:]:
+                synthesized.append({"market": o, "probability": per_other})
+        dist = _normalize_distribution(synthesized, outcomes)
+
+    # Surface the p_yes (probability of outcomes[0]) for logging / calibration.
+    p_yes_value = next(
+        (p.probability for p in dist if p.market == outcomes[0]),
+        prior,
+    )
+    p_yes_value = max(0.01, min(0.99, p_yes_value))
 
     return PredictionResponse(
-        p_yes=shrunk,
-        probabilities=probs_payload,
+        probabilities=dist,
+        p_yes=p_yes_value,
         rationale=(
             f"multi-outcome ({n_out} options, top-{k}, uniform={prior:.3f}); "
-            f"raw={raw_p:.3f} α={MULTI_LLM_SHRINK} → {shrunk:.3f}; {llm_rationale}"
+            f"raw={raw_p:.3f}; {llm_rationale}"
         ),
     )
 
@@ -457,7 +565,7 @@ def _forecast(event: EventRequest) -> PredictionResponse:
         )
         if poly_p is not None:
             p = _shrink_and_clamp(poly_p, alpha=MIN_SHRINK_ALPHA)
-            return PredictionResponse(p_yes=p, rationale=poly_rationale)
+            return _wrap_binary(p, poly_rationale, event)
         return _llm_fallback(event, reason=f"kalshi fetch failed for {event.market_ticker}")
 
     arb_violated = _no_arb_violated(market)
@@ -473,9 +581,8 @@ def _forecast(event: EventRequest) -> PredictionResponse:
         and (raw_p < TAIL_LOW or raw_p > TAIL_HIGH)
     ):
         p = max(0.01, min(0.99, raw_p))
-        return PredictionResponse(
-            p_yes=p,
-            rationale=f"tail-anchor {p:.3f} (vol24h=${vol_24h:.0f}); {rationale}",
+        return _wrap_binary(
+            p, f"tail-anchor {p:.3f} (vol24h=${vol_24h:.0f}); {rationale}", event
         )
 
     # Cross-reference Polymarket when category is on the allowlist.
@@ -493,14 +600,23 @@ def _forecast(event: EventRequest) -> PredictionResponse:
             rationale += f"; stale book {age_h:.1f}h (α ×{STALE_ALPHA_MULTIPLIER:g})"
 
     p = _shrink_and_clamp(raw_p, alpha=alpha)
-    return PredictionResponse(
-        p_yes=p,
-        rationale=f"{rationale}; shrunk α={alpha:.3f} → {p:.3f}",
+    return _wrap_binary(
+        p, f"{rationale}; shrunk α={alpha:.3f} → {p:.3f}", event
     )
 
 
-def _maybe_calibrate(resp: PredictionResponse) -> PredictionResponse:
-    """If a calibration table is present on disk, apply it. Never raises."""
+def _maybe_calibrate(
+    resp: PredictionResponse, event: EventRequest
+) -> PredictionResponse:
+    """If a calibration table is present on disk, apply it. Never raises.
+
+    Calibration is fit on (binary p_yes, binary actual). For multi-outcome
+    events we skip it — recalibrating a binary mapping onto a 35-way
+    distribution would mangle the per-outcome probabilities. For binary
+    events we adjust p_yes and rebuild the 2-outcome distribution.
+    """
+    if resp.p_yes is None or _is_multi_outcome(event):
+        return resp
     try:
         table = get_calibration_table()
     except Exception:
@@ -511,17 +627,27 @@ def _maybe_calibrate(resp: PredictionResponse) -> PredictionResponse:
     adjusted = apply_calibration(raw, table)
     if adjusted == raw:
         return resp
-    return PredictionResponse(
-        p_yes=max(0.01, min(0.99, adjusted)),
-        rationale=f"{resp.rationale}; calibrated {raw:.3f}→{adjusted:.3f}",
+    adjusted = max(0.01, min(0.99, adjusted))
+    return _wrap_binary(
+        adjusted,
+        f"{resp.rationale}; calibrated {raw:.3f}→{adjusted:.3f}",
+        event,
     )
 
 
 def predict(event: dict) -> dict:
-    resp = _forecast(EventRequest(**event))
-    resp = _maybe_calibrate(resp)
+    event_obj = EventRequest(**event)
+    resp = _forecast(event_obj)
+    resp = _maybe_calibrate(resp, event_obj)
     log_prediction(event, resp.p_yes, resp.rationale)
-    return {"p_yes": resp.p_yes, "rationale": resp.rationale}
+    return {
+        "probabilities": [
+            {"market": p.market, "probability": p.probability}
+            for p in resp.probabilities
+        ],
+        "p_yes": resp.p_yes,
+        "rationale": resp.rationale,
+    }
 
 
 app = FastAPI(title="Prophet Hacks Forecast Agent")
@@ -530,7 +656,7 @@ app = FastAPI(title="Prophet Hacks Forecast Agent")
 @app.post("/predict", response_model=PredictionResponse)
 async def predict_endpoint(event: EventRequest) -> PredictionResponse:
     resp = _forecast(event)
-    resp = _maybe_calibrate(resp)
+    resp = _maybe_calibrate(resp, event)
     log_prediction(event.model_dump(), resp.p_yes, resp.rationale)
     return resp
 
