@@ -98,8 +98,18 @@ STALE_HOURS = 6.0
 STALE_ALPHA_MULTIPLIER = 2.0
 APPLY_STALENESS = False
 
-# LLM-output shrinkage. Two tiers based on whether the rationale suggests
-# the model did real research vs speculating from base rates.
+# LLM-output shrinkage. Three tiers based on what the rationale signals.
+#
+#  - DECISIVE: web search uncovered concrete outcome evidence (the event
+#    has already resolved, or a winner has been determined). Hedging the
+#    LLM here is *worse* than trusting it; the squared-error penalty for
+#    pulling a confidently-correct 0.02 up to 0.16 dominates any
+#    protective benefit. Used very sparingly (requires explicit markers).
+#  - GROUNDED: web-search-grounded rationale citing current data, no
+#    decisive outcome signal yet.
+#  - SPECULATIVE: rationale reads as base-rate speculation. Most
+#    aggressive shrinkage applied.
+LLM_SHRINK_DECISIVE = 0.02
 LLM_SHRINK_GROUNDED = 0.05
 LLM_SHRINK_SPECULATIVE = 0.15
 
@@ -140,6 +150,48 @@ _LLM_GROUNDED_MARKERS = (
     "data shows",
     "polls",
     "polling",
+)
+
+# Decisive-evidence markers. When the LLM rationale contains phrases that
+# describe an OUTCOME — not just a forecast or a base rate — we're in the
+# case where the event has effectively already resolved (game played,
+# winner declared, team eliminated, etc.). At that point our usual
+# protective shrinkage HURTS Brier: pulling 0.02 → 0.16 on a question
+# that legitimately answers 0 costs us 0.04 per event vs ~0.001 if
+# trusted. Requires fairly explicit phrasing to avoid false positives
+# from speculative rationales that mention these words in other contexts.
+_LLM_DECISIVE_MARKERS = (
+    "already won",
+    "already lost",
+    "already happened",
+    "already eliminated",
+    "already clinched",
+    "already advanced",
+    "already finished",
+    "already concluded",
+    "already resolved",
+    "did not win",
+    "did not advance",
+    "did not make",
+    "was eliminated",
+    "were eliminated",
+    "has been eliminated",
+    "have been eliminated",
+    "is now confirmed",
+    "has been confirmed",
+    "winner is",
+    "winner was",
+    "outcome is",
+    "outcome was",
+    "has concluded",
+    "game has been played",
+    "match has been played",
+    "series is over",
+    "series has ended",
+    "is impossible",
+    "cannot win",
+    "cannot happen",
+    "is mathematically eliminated",
 )
 
 
@@ -543,8 +595,19 @@ def _market_sanity_check(
 
 
 def _llm_shrink_alpha(rationale: str) -> float:
-    """Pick LLM shrinkage strength based on whether it appears data-grounded."""
+    """Pick LLM shrinkage strength based on rationale content.
+
+    Three tiers, checked in order of decreasing specificity:
+      DECISIVE  → rationale describes an outcome that has already
+                  occurred or been determined (game played, winner
+                  declared, contender eliminated, etc.). Trust the LLM.
+      GROUNDED  → rationale cites current data ("according to", "as of",
+                  "polls show", etc.) but no decisive outcome.
+      SPECULATIVE → rationale reads as base-rate speculation.
+    """
     rationale_lower = rationale.lower()
+    if any(marker in rationale_lower for marker in _LLM_DECISIVE_MARKERS):
+        return LLM_SHRINK_DECISIVE
     if any(marker in rationale_lower for marker in _LLM_GROUNDED_MARKERS):
         return LLM_SHRINK_GROUNDED
     return LLM_SHRINK_SPECULATIVE
@@ -601,7 +664,11 @@ def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
     p_raw, llm_rationale = out
     alpha_base = _llm_shrink_alpha(llm_rationale)
     p = _llm_shrink_with_tail(p_raw, alpha_base=alpha_base)
-    tier = "grounded" if alpha_base == LLM_SHRINK_GROUNDED else "speculative"
+    tier = (
+        "decisive" if alpha_base == LLM_SHRINK_DECISIVE
+        else "grounded" if alpha_base == LLM_SHRINK_GROUNDED
+        else "speculative"
+    )
     return _wrap_binary(
         p,
         f"{reason}; LLM ({tier}, α_base={alpha_base}, raw={p_raw:.3f}→{p:.3f}): {llm_rationale}",

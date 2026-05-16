@@ -2,6 +2,7 @@
 name = "prophet-hacks-agent"
 version = "0.0.1"
 description = "Forecasting agent for Prophet Hacks 2026 (team Brier Patch)."
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     # Prophet Arena upstream — CLI + typed wire models for the eval contract

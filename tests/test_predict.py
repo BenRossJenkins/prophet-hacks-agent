@@ -279,6 +279,37 @@ def test_predict_grounded_llm_gets_less_shrinkage():
     assert "grounded" in out["rationale"]
 
 
+def test_predict_decisive_marker_minimises_shrinkage():
+    """When the rationale describes a confirmed outcome, trust the LLM nearly fully."""
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.llm_forecast_ensemble",
+        return_value=(0.02, "Detroit defeated Cleveland 115-94 in Game 6; Cleveland was eliminated"),
+    ):
+        out = predict(_event())
+    # Decisive tier α_base=0.02. p=0.02 distance=0.48, tail_extra=2.0*0.08=0.16,
+    # α=0.18; shrunk = 0.82*0.02 + 0.18*0.5 = 0.0164 + 0.09 = 0.1064.
+    # Without decisive detection it'd be speculative α_base=0.15 → ~0.20.
+    assert "decisive" in out["rationale"]
+    # Final probability stays close to the LLM's raw signal.
+    assert out["p_yes"] < 0.15
+
+
+def test_decisive_beats_grounded_at_extreme_tail():
+    """Decisive marker present + grounded marker present → still decisive (lower shrink)."""
+    decisive_rationale = "according to multiple sources, Cleveland is already eliminated"
+    grounded_only_rationale = "according to multiple sources, Cleveland is the underdog"
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.llm_forecast_ensemble", return_value=(0.05, decisive_rationale)
+    ):
+        decisive_p = predict(_event())["p_yes"]
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.llm_forecast_ensemble", return_value=(0.05, grounded_only_rationale)
+    ):
+        grounded_p = predict(_event())["p_yes"]
+    # Decisive shrinkage is smaller → final stays closer to the raw 0.05.
+    assert decisive_p < grounded_p
+
+
 def test_predict_speculative_llm_gets_more_shrinkage():
     with patch("agent.predict.get_market", return_value=None), patch(
         "agent.predict.llm_forecast_ensemble",

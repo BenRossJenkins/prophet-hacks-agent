@@ -114,12 +114,32 @@ def _build_user_prompt(event: dict) -> str:
             f"be ~{1/n:.3f}; a top-K question with K winners has uniform "
             f"prior ~K/{n}."
         )
+        # Two worked examples to ground the model in the right reasoning.
+        # Without these, LLMs tend to answer "probability this team wins
+        # the championship" even when the question is "is this team in the
+        # top 4", which is a much higher marginal probability.
         parts.append(
-            "Additionally: include in the JSON a `probabilities` array of "
-            f"{{market, probability}} entries — one per outcome — that sums to "
-            "the expected number of positive outcomes (1.0 for single-winner, "
-            "K for top-K). This is optional but improves scoring when the "
-            "server supports multi-class Brier."
+            "\nWorked examples of the right reasoning:\n"
+            "Example 1 (single-winner, 30 options): 'Who wins the 2026 NBA "
+            "championship? outcomes[0] = Boston Celtics, 30 teams total.' "
+            "Boston is a strong favorite at ~22% on prediction markets → "
+            "p_yes = 0.22. Uniform prior K/N = 1/30 = 0.033; we exceed it "
+            "because Boston is a market favorite.\n"
+            "Example 2 (top-K, 35 options, K=5): 'Which acts finish top 5 "
+            "at Eurovision? outcomes[0] = France, 35 acts total.' "
+            "France is a perennial top finisher; ~40% chance to make top 5 "
+            "→ p_yes = 0.40. Uniform K/N = 5/35 ≈ 0.143; we exceed it "
+            "because France is more likely than the uniform baseline.\n"
+            "Note: in BOTH examples p_yes is the MARGINAL probability for "
+            f"'{first}' alone, not the joint probability of any specific "
+            "winner set."
+        )
+        parts.append(
+            "\nAdditionally: include in the JSON a `probabilities` array "
+            f"of {{market, probability}} entries — one per outcome — that "
+            "sums to the expected number of positive outcomes (1.0 for "
+            "single-winner, K for top-K). This is optional but improves "
+            "scoring when the server supports multi-class Brier."
         )
     parts.append("\nProvide your probability estimate as JSON.")
     return "\n".join(parts)

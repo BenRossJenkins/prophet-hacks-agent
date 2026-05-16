@@ -111,6 +111,8 @@ def classify_path(rationale: str) -> str:
         return "poly-only"
     if "blend" in r and "kalshi" in r.lower():
         return "kalshi+poly-blend"
+    if "LLM (decisive" in r:
+        return "llm-decisive"
     if "LLM (grounded" in r:
         return "llm-grounded"
     if "LLM (speculative" in r:
