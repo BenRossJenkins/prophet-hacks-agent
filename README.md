@@ -1,14 +1,21 @@
-# Prophet Hacks 2026 — Forecasting Agent
+# Prophet Hacks 2026: Forecasting Agent
 
-Solo entry for the [Prophet Hacks](https://www.prophethacks.com) AI forecasting hackathon
-(May 16–17, 2026 build; May 17–28 live evaluation on [Prophet Arena](https://prophetarena.co)).
+Team entry for the [Prophet Hacks](https://www.prophethacks.com) AI forecasting hackathon.
+Build window May 16-17, 2026 (9:00 AM CT kickoff to 5:00 PM CT deadline). Live evaluation on
+[Prophet Arena](https://prophetarena.co) through ~May 31.
+
+## Team
+
+- [@BenRossJenkins](https://github.com/BenRossJenkins)
+- [@duckmoll](https://github.com/duckmoll)
 
 ## Stack
 
 - Python 3.11+
-- [`ai-prophet-core`](https://pypi.org/project/ai-prophet-core/) — SDK & API client
-- [`ai-prophet`](https://pypi.org/project/ai-prophet/) — provides the `prophet` CLI (retrieve / predict / submit)
+- [`ai-prophet-core`](https://pypi.org/project/ai-prophet-core/): SDK and API client
+- [`ai-prophet`](https://pypi.org/project/ai-prophet/): provides the `prophet` CLI (retrieve / predict / submit)
 - FastAPI for the live `/predict` endpoint
+- Anthropic + OpenAI + Google Gemini for the LLM ensemble
 
 ## Setup
 
@@ -46,11 +53,19 @@ prophet forecast predict --events events.json --agent-url http://localhost:8000/
 ## Layout
 
 ```
-agent/            # our forecasting logic — `predict(event)` and FastAPI `app`
-scripts/          # local eval harness, packaging helpers (TBD)
-reference/        # upstream ai-prophet clone (gitignored, for reading source)
+agent/            our forecasting logic: predict(event) and the FastAPI app
+scripts/          local eval harness, backtest fixture builders, daily submit flow
+tests/            unit tests + resolved-markets fixture
+reference/        upstream ai-prophet clone (gitignored, for reading source)
 ```
 
-## Contract & scoring
+## Contract and scoring
 
 See `SUBMISSION_CONTRACT.md`. Scoring is Brier (lower is better), with `p_yes` enforced to [0.01, 0.99].
+
+## Deployment
+
+Live `/predict` endpoint on Cloud Run:
+[`prophet-hacks-agent-651046060481.us-central1.run.app`](https://prophet-hacks-agent-651046060481.us-central1.run.app)
+
+See `CLAUDE.md` for the architectural conventions and the in-source gotchas list.
