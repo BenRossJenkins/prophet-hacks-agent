@@ -98,7 +98,11 @@ def classify_path(rationale: str) -> str:
     """
     r = rationale or ""
     if "multi-outcome" in r:
-        if "poly event" in r:
+        if "kalshi event" in r and "poly event" in r:
+            return "multi-outcome-blend"
+        if "kalshi event" in r or "kalshi only" in r:
+            return "multi-outcome-kalshi"
+        if "poly event" in r or "poly only" in r:
             return "multi-outcome-poly"
         if "LLM unavailable" in r:
             return "multi-outcome-uniform"

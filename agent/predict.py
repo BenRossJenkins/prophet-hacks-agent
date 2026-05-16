@@ -30,7 +30,7 @@ from agent.calibrate import (
     get_calibration_data,
     get_calibration_table,
 )
-from agent.kalshi import get_market
+from agent.kalshi import get_market, kalshi_event_distribution
 from agent.llm import llm_forecast, llm_forecast_ensemble, llm_forecast_ensemble_full
 from agent.polymarket import polymarket_event_distribution, polymarket_quote
 from agent.prediction_log import log_prediction
@@ -321,6 +321,13 @@ def _uniform_prior(event: EventRequest) -> float:
 # prior gets shrunk to 0.90*0.70 + 0.143*0.30 = 0.673. Still meaningful, but
 # not catastrophic if wrong.
 MULTI_LLM_SHRINK = 0.30
+
+# Capped volume-weighted blend for multi-outcome events with both Kalshi and
+# Polymarket distributions. Caps the share of either venue at this fraction
+# so a single very-liquid venue (typically Kalshi for US-resolved questions,
+# or Polymarket for politics) doesn't dominate while ignoring the other's
+# information.
+KALSHI_POLY_MAX_WEIGHT = 0.75
 
 
 # Tail-market triage: when Kalshi is confidently at one tail AND backed by
@@ -676,16 +683,66 @@ def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
     )
 
 
+def _blend_multi_outcome_distributions(
+    kalshi_out: tuple[list[dict[str, float]], float, str],
+    poly_out: tuple[list[dict[str, float]], float, str],
+    outcomes: list[str],
+) -> tuple[list[dict[str, float]], float, str]:
+    """Capped volume-weighted blend of two multi-outcome distributions.
+
+    Per-outcome blend; missing values on either venue pass through (the
+    caller's _normalize_distribution handles the sum-to-1 contract). Cap
+    enforces neither venue can exceed KALSHI_POLY_MAX_WEIGHT, so even
+    when one venue's volume dwarfs the other we still incorporate the
+    minority signal.
+    """
+    k_probs, k_vol, k_rat = kalshi_out
+    p_probs, p_vol, p_rat = poly_out
+
+    k_by = {p["market"]: p["probability"] for p in k_probs}
+    p_by = {p["market"]: p["probability"] for p in p_probs}
+
+    total_vol = max(k_vol + p_vol, 1.0)
+    raw_k_weight = k_vol / total_vol
+    k_weight = min(
+        max(raw_k_weight, 1.0 - KALSHI_POLY_MAX_WEIGHT),
+        KALSHI_POLY_MAX_WEIGHT,
+    )
+    p_weight = 1.0 - k_weight
+
+    blended: list[dict[str, float]] = []
+    for o in outcomes:
+        k_p = k_by.get(o)
+        p_p = p_by.get(o)
+        if k_p is not None and p_p is not None:
+            blended_p = k_weight * k_p + p_weight * p_p
+        elif k_p is not None:
+            blended_p = k_p
+        elif p_p is not None:
+            blended_p = p_p
+        else:
+            blended_p = 0.0
+        blended.append({"market": o, "probability": blended_p})
+
+    rationale = (
+        f"blend k_w={k_weight:.2f} p_w={p_weight:.2f} "
+        f"(k_vol=${k_vol:.0f} p_vol=${p_vol:.0f}); "
+        f"kalshi: {k_rat}; poly: {p_rat}"
+    )
+    return blended, k_vol + p_vol, rationale
+
+
 def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
     """Forecast for events with 3+ outcomes.
 
     Order of preference:
-      1. Polymarket multi-outcome event with sufficient coverage. Real
-         market prices on the same question are a much stronger prior
-         than naked LLM speculation.
-      2. LLM ensemble with explicit "p_yes is P(outcomes[0])" framing
+      1. Kalshi event with mutually_exclusive=True. Canonical resolution
+         venue and clean per-outcome enumeration via child markets.
+      2. Polymarket multi-outcome event with sufficient coverage.
+      3. Blend (1) and (2) when both available — capped volume-weighted.
+      4. LLM ensemble with explicit "p_yes is P(outcomes[0])" framing
          and per-outcome distribution output.
-      3. Uniform 1/N when both fail.
+      5. Uniform 1/N when all fail.
 
     Final distribution always normalized to sum=1 (server contract).
     """
@@ -695,29 +752,51 @@ def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
     k = _estimate_winners_count(event)
     prior = _uniform_prior(event)
 
-    # Step 1: try Polymarket multi-outcome event.
+    # Step 1: try Kalshi multi-outcome event.
+    try:
+        kalshi_out = kalshi_event_distribution(event_d)
+    except Exception as e:
+        logger.warning("kalshi event lookup raised: %s", e)
+        kalshi_out = None
+
+    # Step 2: try Polymarket multi-outcome event.
     try:
         poly_out = polymarket_event_distribution(event_d)
     except Exception as e:
         logger.warning("polymarket event lookup raised: %s", e)
         poly_out = None
-    if poly_out is not None:
-        probs, vol_24h, poly_rationale = poly_out
-        dist = _normalize_distribution(probs, outcomes)
+
+    # Step 3: combine market signals.
+    market_dist: list[dict[str, float]] | None = None
+    market_rationale: str = ""
+    if kalshi_out is not None and poly_out is not None:
+        blended, _vol, rat = _blend_multi_outcome_distributions(
+            kalshi_out, poly_out, outcomes
+        )
+        market_dist = blended
+        market_rationale = rat
+    elif kalshi_out is not None:
+        market_dist = kalshi_out[0]
+        market_rationale = f"kalshi only; {kalshi_out[2]}"
+    elif poly_out is not None:
+        market_dist = poly_out[0]
+        market_rationale = f"poly only; {poly_out[2]}"
+
+    if market_dist is not None:
+        dist = _normalize_distribution(market_dist, outcomes)
         p_yes_value = next(
-            (p.probability for p in dist if p.market == outcomes[0]),
-            prior,
+            (p.probability for p in dist if p.market == outcomes[0]), prior
         )
         p_yes_value = max(0.01, min(0.99, p_yes_value))
         return PredictionResponse(
             probabilities=dist,
             p_yes=p_yes_value,
             rationale=(
-                f"multi-outcome ({n_out} options, top-{k}); {poly_rationale}"
+                f"multi-outcome ({n_out} options, top-{k}); {market_rationale}"
             ),
         )
 
-    # Step 2: LLM ensemble.
+    # Step 4: LLM ensemble.
     out = llm_forecast_ensemble_full(event_d)
     if out is None:
         # Uniform fallback. For top-K questions, every outcome is equally
