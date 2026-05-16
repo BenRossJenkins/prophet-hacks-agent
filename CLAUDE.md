@@ -28,23 +28,36 @@ predict(event):
   3. Tail-anchor triage: if Kalshi vol_24h ≥ $500 AND raw_p outside
      [0.05, 0.95], return market price directly — skip Polymarket, LLM,
      shrinkage. (Tails are settled; LLM disagreement costs Brier.)
-  4. If category in POLYMARKET_CATEGORIES, fetch Polymarket sibling and
-     volume-weighted-blend with Kalshi. Also acts as fallback when
-     Kalshi has no signal.
+  4. Cross-venue agreement gate (POLYMARKET_CATEGORIES only):
+        - In safe band ([0.20, 0.80] with vol ≥ $10k): fetch Polymarket
+          but skip the blend when |kalshi - poly| ≤ 0.03 (agreement
+          carries no signal); blend when they disagree.
+        - Outside safe band: always blend with vol-weighting. Poly
+          also acts as fallback when Kalshi has no signal at all.
   5. Apply volume-weighted shrinkage toward 0.5.
   6. If no market signal at all: try category_prior() (NWS for Weather,
      yfinance for Crypto, ESPN for Sports, Manifold for Politics/World/
      Companies + Sports fallback).
   7. LLM ensemble[Opus-thinking, GPT-5-mini, Gemini-2.5-flash] with
-     shared web search → median → tail-aware two-tier LLM shrinkage.
-     (LLM denylist is currently empty — see priors.py.)
+     shared web search (Anthropic anchors search, OpenAI + Gemini
+     receive its findings as `search_context`) → median → tail-aware
+     non-linear LLM shrinkage. (LLM denylist is currently empty — the
+     safe-band auto-anchor + tail-anchor triage handle the cases the
+     denylist used to gate.)
   8. Market sanity guardrail: if final p deviates >0.30 from a deep
      liquid Kalshi mid (vol_24h ≥ $100k), anchor 0.6/0.4 toward market.
-  9. Calibration (when GCS table present, binary events only) → clamp.
+  9. Path-stratified calibration (binary events only): classify the
+     rationale into one of ~12 pipeline-branch labels, look up that
+     stratum's table from GCS-backed payload (60s cache), require
+     n ≥ MIN_BUCKET_N_FOR_PATH (=5) in the matching bucket — else fall
+     back to the global table. The final shift is bounded to
+     ±MAX_CALIBRATION_SHIFT (=0.05) so a noisy small-N bucket can't
+     yank a confident prediction wildly off.
   10. Wrap p_yes into {market: outcomes[0], probability: p},
       {market: outcomes[1], probability: 1-p}. Always clamp p to
       [0.01, 0.99] per submission contract.
-  11. Log every prediction to PREDICTION_LOG_PATH.
+  11. Log every prediction to PREDICTION_LOG_PATH (local FS) AND
+      PREDICTION_LOG_GCS_PREFIX (one object per event) for durability.
 ```
 
 Module map:
@@ -58,7 +71,7 @@ Module map:
 - `agent/sports.py` — ESPN moneyline-derived prior for Sports
 - `agent/manifold.py` — Manifold-backed prior for Politics/World/Companies/Sports fallback
 - `agent/llm.py` — multi-vendor LLM ensemble (Anthropic / OpenAI / Google)
-- `agent/calibrate.py` — binned calibration table (GCS-backed daily refit)
+- `agent/calibrate.py` — path-stratified calibration table (GCS, daily refit, bounded ±0.05 shift)
 - `agent/prediction_log.py` — defensive append-only log of every forecast
 
 ## Conventions
@@ -129,6 +142,13 @@ internally. Additional shrinkage on top would double-count.
    parallel with `search_context` injected) typical latency is
    30-60 s; the deadline is just safety.
 
+   **Operational rule of thumb:** healthy ensemble p99 should be
+   under 90s. If Cloud Run logs show p99 climbing past 180s, one
+   vendor is regressing — identify the slow member from the
+   per-vendor logs and drop it from `ENSEMBLE_MODELS`. The
+   survivor-median path handles partial ensembles natively, so this
+   is a config change, not code.
+
 6. **Web search in backtest = leakage.** Settled markets are public
    history; a web-searching LLM finds the actual outcome and looks
    brilliant while being useless forward-looking. `scripts/backtest.py
@@ -155,11 +175,13 @@ claim a real win.
 ## What NOT to do
 
 - **Don't enable LLM blend on liquid markets** without per-category
-  validation. Naive blending of an LLM with a well-calibrated market
-  price usually hurts Brier and our weather-heavy fixture is too
-  narrow to A/B safely. The market sanity guardrail in `_forecast`
-  catches the worst cases (deviation > 0.30 from deep liquid Kalshi
-  mid) but is intentionally conservative.
+  validation. The pipeline structurally avoids this already: the
+  safe-band auto-anchor (step 4) keeps the LLM out of the loop on
+  liquid Kalshi books in [0.20, 0.80], and the market sanity
+  guardrail (step 8) catches anything that does drift more than 0.30
+  from a deep mid. If you're tempted to add LLM blending on liquid
+  markets, validate per-category on resolved data first; the
+  weather-heavy fixture isn't representative enough to A/B safely.
 - **Don't add models to the ensemble** unless they're a new vendor.
   Same-family variants share architecture and training data; they're
   highly correlated and add cost without decorrelating errors.
