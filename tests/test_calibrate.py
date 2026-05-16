@@ -93,6 +93,106 @@ def test_load_returns_none_for_wrong_version(tmp_path: Path):
     assert load_calibration(p) is None
 
 
+def test_load_v1_format_still_works(tmp_path: Path):
+    """Legacy v1 single-bucket-list shape is coerced to v2."""
+    from agent.calibrate import load_calibration_data
+
+    p = tmp_path / "v1.json"
+    p.write_text(
+        '{"version": 1, "buckets": [{"bucket_lo": 0.0, "bucket_hi": 0.1, '
+        '"n": 5, "mean_p": 0.05, "mean_actual": 0.0}]}'
+    )
+    data = load_calibration_data(p)
+    assert data is not None
+    assert data["by_path"] == {}
+    assert len(data["global"]) == 1
+
+
+# ---- path-stratified API ------------------------------------------------
+
+
+def test_fit_calibration_by_path_splits_rows():
+    from agent.calibrate import fit_calibration_by_path
+
+    rows = [
+        # Two tail-anchor rows in the same bucket
+        {"p_yes": 0.92, "result": "yes", "metadata": {"path": "tail-anchor"}},
+        {"p_yes": 0.94, "result": "yes", "metadata": {"path": "tail-anchor"}},
+        # Three llm-speculative rows
+        {"p_yes": 0.60, "result": "no", "metadata": {"path": "llm-speculative"}},
+        {"p_yes": 0.65, "result": "no", "metadata": {"path": "llm-speculative"}},
+        {"p_yes": 0.62, "result": "yes", "metadata": {"path": "llm-speculative"}},
+    ]
+    data = fit_calibration_by_path(rows, n_bins=10)
+    # Global table has all 5 rows split into buckets.
+    assert isinstance(data["global"], list)
+    assert len(data["global"]) >= 1
+    # by_path has both labels.
+    assert "tail-anchor" in data["by_path"]
+    assert "llm-speculative" in data["by_path"]
+
+
+def test_apply_calibration_data_uses_path_when_n_sufficient():
+    from agent.calibrate import apply_calibration_data
+
+    data = {
+        "global": [
+            {"bucket_lo": 0.9, "bucket_hi": 1.0, "n": 100, "mean_p": 0.95, "mean_actual": 0.92}
+        ],
+        "by_path": {
+            "tail-anchor": [
+                {"bucket_lo": 0.9, "bucket_hi": 1.0, "n": 20, "mean_p": 0.95, "mean_actual": 0.88}
+            ]
+        },
+    }
+    # Path bucket has n=20 >= min_n: use it.
+    assert apply_calibration_data(0.95, data, path="tail-anchor") == pytest.approx(0.88)
+    # No path provided → global.
+    assert apply_calibration_data(0.95, data) == pytest.approx(0.92)
+
+
+def test_apply_calibration_data_falls_back_to_global_at_low_n():
+    from agent.calibrate import apply_calibration_data
+
+    data = {
+        "global": [
+            {"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 50, "mean_p": 0.55, "mean_actual": 0.70}
+        ],
+        "by_path": {
+            "tail-anchor": [
+                # n=2, below MIN_BUCKET_N_FOR_PATH (5) — should be ignored.
+                {"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 2, "mean_p": 0.55, "mean_actual": 0.40}
+            ]
+        },
+    }
+    # Path bucket exists but n<min — falls back to global.
+    assert apply_calibration_data(0.55, data, path="tail-anchor") == pytest.approx(0.70)
+
+
+def test_apply_calibration_data_no_data_passes_through():
+    from agent.calibrate import apply_calibration_data
+
+    assert apply_calibration_data(0.42, None) == 0.42
+    assert apply_calibration_data(0.42, {}) == 0.42
+
+
+def test_save_calibration_accepts_v2_payload(tmp_path: Path):
+    from agent.calibrate import load_calibration_data
+
+    payload = {
+        "global": [{"bucket_lo": 0.0, "bucket_hi": 0.1, "n": 1, "mean_p": 0.05, "mean_actual": 0.0}],
+        "by_path": {
+            "kalshi-anchor": [
+                {"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 10, "mean_p": 0.55, "mean_actual": 0.6}
+            ]
+        },
+    }
+    out = tmp_path / "cal.json"
+    save_calibration(payload, out)
+    loaded = load_calibration_data(out)
+    assert loaded == payload
+
+
 def test_get_calibration_table_uses_env(tmp_path: Path, monkeypatch):
     out = tmp_path / "cal.json"
     save_calibration(
@@ -119,14 +219,15 @@ def test_get_calibration_table_prefers_gcs_when_uri_set(tmp_path: Path, monkeypa
     monkeypatch.setenv("CALIBRATION_PATH", str(out))
     monkeypatch.setenv("CALIBRATION_GCS_URI", "gs://bucket/file.json")
 
-    # GCS returns a 2-bucket table
+    # GCS returns a 2-bucket table (wrapped in v2 payload)
     gcs_table = [
         {"bucket_lo": 0.3, "bucket_hi": 0.4, "n": 5, "mean_p": 0.35, "mean_actual": 0.7},
         {"bucket_lo": 0.6, "bucket_hi": 0.7, "n": 5, "mean_p": 0.65, "mean_actual": 0.4},
     ]
     from agent import calibrate as cal_mod
     cal_mod._cache.clear()
-    with patch("agent.calibrate._load_from_gcs", return_value=gcs_table):
+    gcs_payload = {"global": gcs_table, "by_path": {}}
+    with patch("agent.calibrate._load_from_gcs", return_value=gcs_payload):
         table = get_calibration_table()
     assert table == gcs_table
 

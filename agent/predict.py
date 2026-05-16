@@ -24,7 +24,12 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-from agent.calibrate import apply_calibration, get_calibration_table
+from agent.calibrate import (
+    apply_calibration,
+    apply_calibration_data,
+    get_calibration_data,
+    get_calibration_table,
+)
 from agent.kalshi import get_market
 from agent.llm import llm_forecast, llm_forecast_ensemble, llm_forecast_ensemble_full
 from agent.polymarket import polymarket_event_distribution, polymarket_quote
@@ -757,29 +762,33 @@ def _forecast(event: EventRequest) -> PredictionResponse:
 def _maybe_calibrate(
     resp: PredictionResponse, event: EventRequest
 ) -> PredictionResponse:
-    """If a calibration table is present on disk, apply it. Never raises.
+    """If a calibration table is present, apply path-stratified lookup.
 
-    Calibration is fit on (binary p_yes, binary actual). For multi-outcome
-    events we skip it — recalibrating a binary mapping onto a 35-way
-    distribution would mangle the per-outcome probabilities. For binary
-    events we adjust p_yes and rebuild the 2-outcome distribution.
+    Path is classified from the rationale via prediction_log.classify_path.
+    Per-path bucket used when its `n >= MIN_BUCKET_N_FOR_PATH`; otherwise
+    falls back to the global table. Multi-outcome events skip calibration
+    entirely (the binary p_yes map doesn't apply to a 35-way distribution).
+    Never raises.
     """
     if resp.p_yes is None or _is_multi_outcome(event):
         return resp
     try:
-        table = get_calibration_table()
+        data = get_calibration_data()
     except Exception:
         return resp
-    if not table:
+    if not data:
         return resp
+    from agent.prediction_log import classify_path  # lazy import
+
+    path = classify_path(resp.rationale or "")
     raw = resp.p_yes
-    adjusted = apply_calibration(raw, table)
+    adjusted = apply_calibration_data(raw, data, path=path)
     if adjusted == raw:
         return resp
     adjusted = max(0.01, min(0.99, adjusted))
     return _wrap_binary(
         adjusted,
-        f"{resp.rationale}; calibrated {raw:.3f}→{adjusted:.3f}",
+        f"{resp.rationale}; calibrated[{path}] {raw:.3f}→{adjusted:.3f}",
         event,
     )
 
