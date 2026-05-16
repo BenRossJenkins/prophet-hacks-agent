@@ -273,8 +273,9 @@ def test_predict_grounded_llm_gets_less_shrinkage():
         return_value=(0.95, "web search found Reuters article confirming"),
     ):
         out = predict(_event())
-    expected = 0.95 * 0.95 + 0.5 * 0.05
-    assert out["p_yes"] == pytest.approx(expected)
+    # p=0.95 grounded: tail-aware shrink. distance=0.45, extra=0.10, α=0.15.
+    # shrunk = 0.85*0.95 + 0.15*0.5 = 0.8825
+    assert out["p_yes"] == pytest.approx(0.8825)
     assert "grounded" in out["rationale"]
 
 
@@ -394,6 +395,136 @@ def test_predict_does_not_apply_staleness_by_default():
     with patch("agent.predict.get_market", return_value=market):
         out = predict(_event())
     assert "stale book" not in out["rationale"]
+
+
+# ---- Tail-aware LLM shrinkage ---------------------------------------------
+
+
+def test_tail_shrink_noop_in_central_range():
+    """For p near 0.5, behaves like normal linear shrinkage."""
+    from agent.predict import _llm_shrink_with_tail
+
+    # At p=0.6, distance=0.10 < 0.40 threshold, no extra alpha.
+    out = _llm_shrink_with_tail(0.6, alpha_base=0.05)
+    expected = 0.95 * 0.6 + 0.05 * 0.5  # 0.595
+    assert out == pytest.approx(expected)
+
+
+def test_tail_shrink_kicks_in_at_high_tail():
+    """At p=0.95, extra shrinkage pulls more aggressively toward 0.5."""
+    from agent.predict import _llm_shrink_with_tail
+
+    out = _llm_shrink_with_tail(0.95, alpha_base=0.05)
+    # distance=0.45, extra=2.0*0.05=0.10, alpha=0.15
+    # shrunk = 0.85 * 0.95 + 0.15 * 0.5 = 0.8825
+    assert out == pytest.approx(0.8825)
+
+
+def test_tail_shrink_kicks_in_at_low_tail():
+    """Symmetric: at p=0.05, extra shrinkage pulls toward 0.5 from below."""
+    from agent.predict import _llm_shrink_with_tail
+
+    out = _llm_shrink_with_tail(0.05, alpha_base=0.05)
+    # distance=0.45, alpha=0.15; shrunk = 0.85 * 0.05 + 0.15 * 0.5 = 0.1175
+    assert out == pytest.approx(0.1175)
+
+
+def test_tail_shrink_caps_alpha():
+    """The cap fires only when alpha_base is high enough that the tail boost
+    would push alpha past 0.50. With base=0.40 and p=0.99, alpha would be
+    0.40 + 0.99·2 - 0.80 = 0.58 → capped at 0.50."""
+    from agent.predict import _llm_shrink_with_tail
+
+    out = _llm_shrink_with_tail(0.99, alpha_base=0.40)
+    # alpha=0.50, shrunk = 0.50*0.99 + 0.50*0.5 = 0.745
+    assert out == pytest.approx(0.745)
+
+
+def test_tail_shrink_preserves_directional_signal():
+    """Even at extreme tail, output is still on the correct side of 0.5."""
+    from agent.predict import _llm_shrink_with_tail
+
+    high = _llm_shrink_with_tail(0.99, alpha_base=0.15)
+    low = _llm_shrink_with_tail(0.01, alpha_base=0.15)
+    assert high > 0.5
+    assert low < 0.5
+
+
+# ---- Market sanity guardrail -----------------------------------------------
+
+
+def _deep_market(yes_bid: str, yes_ask: str, vol: float = 200_000) -> dict:
+    return {
+        "yes_bid_dollars": yes_bid,
+        "yes_ask_dollars": yes_ask,
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": str(round(1 - float(yes_ask), 2)),
+        "no_ask_dollars": str(round(1 - float(yes_bid), 2)),
+        "last_price_dollars": str((float(yes_bid) + float(yes_ask)) / 2),
+        "volume_24h_fp": str(vol),
+    }
+
+
+def test_guardrail_anchors_when_polymarket_pulls_far_from_kalshi():
+    """Deep Kalshi at 0.50, Polymarket at 0.95 → blended drifts > 0.30 from Kalshi → anchor back."""
+    e = _event()
+    e["category"] = "Politics"
+    kalshi = _deep_market("0.49", "0.51", vol=200_000)
+    with patch("agent.predict.get_market", return_value=kalshi), patch(
+        "agent.predict.polymarket_quote",
+        return_value=(0.95, 500_000.0, "poly p=0.95 vol24h=$500000 (match=0.85)"),
+    ):
+        out = predict(e)
+    # Without guardrail, vol-weighted blend = (0.50*200k + 0.95*500k) / 700k ≈ 0.821 → shrunk slightly.
+    # Deviation from kalshi mid (0.50) is large; guardrail blends 0.6*0.50 + 0.4*final.
+    assert "guardrail" in out["rationale"]
+    # Result should be closer to Kalshi than to Polymarket.
+    assert abs(out["p_yes"] - 0.50) < abs(out["p_yes"] - 0.95)
+
+
+def test_guardrail_no_op_for_low_volume_kalshi():
+    """Guardrail requires >= GUARDRAIL_MIN_VOL_24H; small books don't trigger anchor."""
+    from agent.predict import GUARDRAIL_MIN_VOL_24H
+
+    e = _event()
+    e["category"] = "Politics"
+    kalshi = _deep_market("0.49", "0.51", vol=GUARDRAIL_MIN_VOL_24H - 1)
+    with patch("agent.predict.get_market", return_value=kalshi), patch(
+        "agent.predict.polymarket_quote",
+        return_value=(0.95, 50_000.0, "poly"),
+    ):
+        out = predict(e)
+    assert "guardrail" not in out["rationale"]
+
+
+def test_guardrail_no_op_when_deviation_small():
+    """When our final p is close to Kalshi mid, no anchoring happens."""
+    e = _event()
+    e["category"] = "Politics"
+    kalshi = _deep_market("0.49", "0.51", vol=200_000)
+    # Polymarket close to Kalshi → blended price stays near 0.50.
+    with patch("agent.predict.get_market", return_value=kalshi), patch(
+        "agent.predict.polymarket_quote",
+        return_value=(0.52, 100_000.0, "poly p=0.52"),
+    ):
+        out = predict(e)
+    assert "guardrail" not in out["rationale"]
+
+
+def test_guardrail_does_not_apply_to_multi_outcome():
+    """Multi-outcome events shouldn't trigger the binary guardrail."""
+    e = _event()
+    e["category"] = "Entertainment"
+    e["outcomes"] = ["A", "B", "C", "D", "E"]
+    # llm_forecast_ensemble_full would be called; mock it to return a distribution.
+    with patch("agent.predict.get_market") as market_mock, patch(
+        "agent.predict.llm_forecast_ensemble_full",
+        return_value=(0.95, None, "confident"),
+    ):
+        out = predict(e)
+    market_mock.assert_not_called()
+    assert "guardrail" not in out["rationale"]
 
 
 # ---- Tail-market triage -----------------------------------------------

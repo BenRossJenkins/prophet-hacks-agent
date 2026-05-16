@@ -98,6 +98,40 @@ def test_shared_search_falls_back_to_parallel_when_anchor_fails():
     assert all(search is True for _, search in non_anchor)
 
 
+def test_ensemble_deadline_returns_partial_results():
+    """If a vendor hangs past the ensemble deadline, return what arrived."""
+    import time as _time
+
+    from agent.llm import llm_forecast_ensemble_full
+
+    def slow(event, *, model, with_web_search):
+        if model == "claude-opus-4-7":
+            # Anchor returns quickly.
+            return 0.5, None, "anchor"
+        if model == "gpt-5-mini":
+            return 0.6, None, "fast"
+        if model == "hangs-forever":
+            _time.sleep(30)  # exceeds the patched deadline
+            return 0.7, None, "should never reach this"
+        return None
+
+    with patch("agent.llm.llm_forecast_full", side_effect=slow), patch(
+        "agent.llm.ENSEMBLE_HARD_DEADLINE_SECONDS", 0.5
+    ):
+        out = llm_forecast_ensemble_full(
+            {"title": "x"},
+            models=("claude-opus-4-7", "gpt-5-mini", "hangs-forever"),
+            with_web_search=True,
+        )
+    assert out is not None
+    p, _, rationale = out
+    # The hung vendor was abandoned; only anchor + fast vendor contributed.
+    assert "claude-opus-4-7" in rationale
+    assert "gpt-5-mini" in rationale
+    # Median of {0.5, 0.6} = 0.55.
+    assert p == pytest.approx(0.55)
+
+
 def test_shared_search_disabled_runs_all_parallel():
     seen: list[tuple[str, bool]] = []
 

@@ -98,6 +98,18 @@ APPLY_STALENESS = False
 LLM_SHRINK_GROUNDED = 0.05
 LLM_SHRINK_SPECULATIVE = 0.15
 
+# Non-linear tail boost. LLMs are reliably overconfident in the deep tails
+# (p < 0.10 or p > 0.90). Beyond the fixed base α, every unit of distance
+# from 0.5 past LLM_SHRINK_TAIL_THRESHOLD adds extra α. Tuned so that:
+#   p=0.95 grounded   → α≈0.15 → final ≈ 0.88
+#   p=0.99 grounded   → α≈0.23 → final ≈ 0.88
+#   p=0.95 speculative → α≈0.25 → final ≈ 0.84
+# Capped so we never push past 0.75/0.25 (which would flip the LLM's
+# directional signal entirely).
+LLM_SHRINK_TAIL_THRESHOLD = 0.40
+LLM_SHRINK_TAIL_SLOPE = 2.0
+LLM_SHRINK_MAX_ALPHA = 0.50
+
 # Polymarket cross-reference. Categories where a Polymarket sibling is most
 # likely to exist + add signal. Weather/Crypto/Sports are excluded: Weather
 # has no Poly equivalent, Crypto has its own quantitative prior, and Sports
@@ -267,6 +279,16 @@ TAIL_HIGH = 0.95
 TAIL_MIN_VOL_24H = 500.0  # USD — high enough that the price reflects real consensus,
                           # not a $5 thin-book accident.
 
+# Market-deviation sanity guardrail. When our final prediction differs
+# materially from a deep liquid Kalshi book, one of us is wrong — and at
+# this volume threshold the asymmetric Brier penalty (a confident
+# disagree-and-be-wrong costs 4-9x staying near market) makes anchoring
+# harder almost always the safer bet. This is a guardrail, not a clamp:
+# we blend back toward market, we don't replace.
+GUARDRAIL_DEVIATION = 0.30      # |our_p − kalshi_mid| above this triggers anchoring
+GUARDRAIL_MIN_VOL_24H = 100_000  # USD — deep, calibrated, well-informed books only
+GUARDRAIL_ANCHOR_WEIGHT = 0.60   # how much weight market gets in the blend-back
+
 
 def _f(market: dict, key: str) -> float:
     try:
@@ -434,12 +456,81 @@ def _blend_with_polymarket(
     )
 
 
+def _market_sanity_check(
+    resp: PredictionResponse, market: dict | None, event: EventRequest
+) -> PredictionResponse:
+    """Anchor `resp.p_yes` back toward Kalshi mid when deviation is large.
+
+    Only triggers on:
+      - Binary events with a known outcomes list and a non-None resp.p_yes
+      - A Kalshi market fetched successfully with vol_24h >= GUARDRAIL_MIN_VOL_24H
+      - A usable bid+ask midpoint
+      - |resp.p_yes − market_mid| > GUARDRAIL_DEVIATION
+
+    Doesn't fire on multi-outcome paths or low-volume markets.
+    """
+    if market is None or resp.p_yes is None or _is_multi_outcome(event):
+        return resp
+
+    vol_24h = _f(market, "volume_24h_fp")
+    if vol_24h < GUARDRAIL_MIN_VOL_24H:
+        return resp
+
+    yes_bid = _f(market, "yes_bid_dollars")
+    yes_ask = _f(market, "yes_ask_dollars")
+    if yes_bid <= 0 or yes_ask <= 0:
+        return resp
+    market_mid = (yes_bid + yes_ask) / 2
+
+    deviation = abs(resp.p_yes - market_mid)
+    if deviation <= GUARDRAIL_DEVIATION:
+        return resp
+
+    anchored = (
+        GUARDRAIL_ANCHOR_WEIGHT * market_mid
+        + (1 - GUARDRAIL_ANCHOR_WEIGHT) * resp.p_yes
+    )
+    anchored = max(0.01, min(0.99, anchored))
+    note = (
+        f"; guardrail anchored {resp.p_yes:.3f}→{anchored:.3f} "
+        f"(kalshi mid={market_mid:.3f}, vol24h=${vol_24h:.0f}, dev={deviation:.2f})"
+    )
+    logger.warning(
+        "guardrail: %s deviated %.2f from Kalshi mid (%.3f→%.3f, vol=%s)",
+        event.market_ticker,
+        deviation,
+        resp.p_yes,
+        anchored,
+        vol_24h,
+    )
+    return _wrap_binary(anchored, (resp.rationale or "") + note, event)
+
+
 def _llm_shrink_alpha(rationale: str) -> float:
     """Pick LLM shrinkage strength based on whether it appears data-grounded."""
     rationale_lower = rationale.lower()
     if any(marker in rationale_lower for marker in _LLM_GROUNDED_MARKERS):
         return LLM_SHRINK_GROUNDED
     return LLM_SHRINK_SPECULATIVE
+
+
+def _llm_shrink_with_tail(p: float, alpha_base: float) -> float:
+    """Shrink LLM output toward 0.5 with extra penalty in the deep tails.
+
+    For p in the central range (distance from 0.5 ≤ THRESHOLD), uses
+    alpha_base linearly. Beyond the threshold, adds extra alpha
+    proportional to how far past the threshold the prediction sits.
+    Caps at LLM_SHRINK_MAX_ALPHA to preserve the LLM's directional
+    signal even at the extreme tails.
+    """
+    p = max(0.0, min(1.0, p))
+    distance = abs(p - 0.5)
+    extra = 0.0
+    if distance > LLM_SHRINK_TAIL_THRESHOLD:
+        extra = (distance - LLM_SHRINK_TAIL_THRESHOLD) * LLM_SHRINK_TAIL_SLOPE
+    alpha = min(LLM_SHRINK_MAX_ALPHA, alpha_base + extra)
+    shrunk = (1 - alpha) * p + alpha * 0.5
+    return max(0.01, min(0.99, shrunk))
 
 
 def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
@@ -472,12 +563,12 @@ def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
     if out is None:
         return _wrap_binary(0.5, f"{reason}; LLM unavailable; uniform prior", event)
     p_raw, llm_rationale = out
-    alpha = _llm_shrink_alpha(llm_rationale)
-    p = _shrink_and_clamp(p_raw, alpha=alpha)
-    tier = "grounded" if alpha == LLM_SHRINK_GROUNDED else "speculative"
+    alpha_base = _llm_shrink_alpha(llm_rationale)
+    p = _llm_shrink_with_tail(p_raw, alpha_base=alpha_base)
+    tier = "grounded" if alpha_base == LLM_SHRINK_GROUNDED else "speculative"
     return _wrap_binary(
         p,
-        f"{reason}; LLM ({tier}, α={alpha}, raw={p_raw:.3f}): {llm_rationale}",
+        f"{reason}; LLM ({tier}, α_base={alpha_base}, raw={p_raw:.3f}→{p:.3f}): {llm_rationale}",
         event,
     )
 
@@ -600,9 +691,10 @@ def _forecast(event: EventRequest) -> PredictionResponse:
             rationale += f"; stale book {age_h:.1f}h (α ×{STALE_ALPHA_MULTIPLIER:g})"
 
     p = _shrink_and_clamp(raw_p, alpha=alpha)
-    return _wrap_binary(
-        p, f"{rationale}; shrunk α={alpha:.3f} → {p:.3f}", event
-    )
+    resp = _wrap_binary(p, f"{rationale}; shrunk α={alpha:.3f} → {p:.3f}", event)
+    # Sanity guardrail: if Polymarket blend or anything else pulled us far
+    # from a deep liquid Kalshi book, anchor back. No-op otherwise.
+    return _market_sanity_check(resp, market, event)
 
 
 def _maybe_calibrate(

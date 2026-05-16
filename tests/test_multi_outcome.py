@@ -154,7 +154,8 @@ def test_parse_full_ignores_malformed_probabilities():
 # ---- ensemble aggregation ----
 
 
-def test_aggregate_probabilities_takes_median_per_outcome():
+def test_aggregate_probabilities_means_normalized_vendor_dists():
+    """Each vendor's dist is renormalized to sum=1, then per-outcome mean."""
     per_model = [
         ("m1", [{"market": "A", "probability": 0.2}, {"market": "B", "probability": 0.5}]),
         ("m2", [{"market": "A", "probability": 0.3}, {"market": "B", "probability": 0.4}]),
@@ -163,8 +164,15 @@ def test_aggregate_probabilities_takes_median_per_outcome():
     out = _aggregate_probabilities(per_model, outcomes=["A", "B"])
     assert out is not None
     by_market = {e["market"]: e["probability"] for e in out}
-    assert by_market["A"] == pytest.approx(0.3)
-    assert by_market["B"] == pytest.approx(0.5)
+    # Renormalized per vendor:
+    #   m1: A=2/7, B=5/7
+    #   m2: A=3/7, B=4/7
+    #   m3: A=4/10=0.4, B=6/10=0.6
+    # Mean: A ≈ (0.2857 + 0.4286 + 0.4)/3 ≈ 0.371; B ≈ (0.7143 + 0.5714 + 0.6)/3 ≈ 0.629
+    assert by_market["A"] == pytest.approx(0.371, abs=0.01)
+    assert by_market["B"] == pytest.approx(0.629, abs=0.01)
+    # Critical: probabilities sum to 1.
+    assert by_market["A"] + by_market["B"] == pytest.approx(1.0)
 
 
 def test_aggregate_returns_none_when_too_few_contributors():
@@ -179,15 +187,52 @@ def test_aggregate_returns_none_when_too_few_contributors():
     assert out is None
 
 
-def test_aggregate_skips_outcomes_no_vendor_covered():
+def test_aggregate_does_not_inflate_consensus_zero_outcomes():
+    """Regression test for the Dallas bug.
+
+    All vendors give a low probability for outcome X. Previously,
+    median-of-medians could sum to << 1, and downstream normalization
+    multiplied every outcome (including X) by the same factor, inflating
+    X's stated 0.01 into ~0.09. The new mean-of-renormalized aggregation
+    should preserve X near its agreed-upon ~0.01.
+    """
+    # 15 outcomes; outcomes[0] is X (e.g. 'Dallas'). Each vendor agrees X
+    # is near zero, distributes mass across other outcomes.
+    outcomes = [f"O{i}" for i in range(15)]
+    per_model = [
+        ("opus",   [{"market": "O0", "probability": 0.01}] +
+                    [{"market": f"O{i}", "probability": 0.99/14} for i in range(1, 15)]),
+        ("gpt5",   [{"market": "O0", "probability": 0.01}] +
+                    [{"market": f"O{i}", "probability": 0.99/14} for i in range(1, 15)]),
+        ("gemini", [{"market": "O0", "probability": 0.17}] +
+                    [{"market": f"O{i}", "probability": 0.83/14} for i in range(1, 15)]),
+    ]
+    out = _aggregate_probabilities(per_model, outcomes=outcomes)
+    assert out is not None
+    by_market = {e["market"]: e["probability"] for e in out}
+    # Final prob for O0 should be near mean of (0.01, 0.01, 0.17) ≈ 0.063.
+    # Critically NOT inflated to ~0.086 by post-aggregate normalization.
+    assert by_market["O0"] < 0.08
+    assert by_market["O0"] == pytest.approx(0.063, abs=0.01)
+    # Distribution still sums to 1.
+    total = sum(by_market.values())
+    assert total == pytest.approx(1.0)
+
+
+def test_aggregate_fills_uncovered_outcomes_with_zero():
+    """Outcomes no vendor mentioned get 0 in each vendor's normalized dist."""
     per_model = [
         ("m1", [{"market": "A", "probability": 0.5}]),
         ("m2", [{"market": "A", "probability": 0.6}]),
     ]
     out = _aggregate_probabilities(per_model, outcomes=["A", "B"])
     assert out is not None
-    assert len(out) == 1
-    assert out[0]["market"] == "A"
+    assert len(out) == 2
+    by_market = {e["market"]: e["probability"] for e in out}
+    # Both vendors only gave A; normalize their dists to {A: 1.0, B: 0.0};
+    # mean is {A: 1.0, B: 0.0}.
+    assert by_market["A"] == pytest.approx(1.0)
+    assert by_market["B"] == pytest.approx(0.0)
 
 
 # ---- predict() end-to-end for multi-outcome ----

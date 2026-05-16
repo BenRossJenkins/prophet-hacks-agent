@@ -7,27 +7,27 @@ import pytest
 from agent.priors import LLM_DENIED_CATEGORIES, category_prior, llm_allowed_for
 
 
-def test_weather_is_denied():
-    assert llm_allowed_for("Climate and Weather") is False
+def test_no_categories_denied_by_default():
+    """Denylist was emptied 2026-05-16; typed priors run first, LLM handles
+    everything else (with shrinkage). Hurricane/named-storm/IPO-style
+    questions that the typed prior can't handle now reach the LLM ensemble
+    instead of being hard-capped at 0.5.
+    """
+    assert LLM_DENIED_CATEGORIES == frozenset()
 
 
-def test_crypto_is_denied():
-    assert llm_allowed_for("Crypto") is False
-
-
-def test_financials_is_allowed():
-    # Financials is dominated by IPO/CEO speculation — knowledge questions
-    # where LLM-with-web-search performs reasonably. Not denied.
-    assert llm_allowed_for("Financials") is True
-
-
-def test_other_categories_allowed():
-    for cat in ("Politics", "Sports", "Entertainment", "Economics", "World"):
+def test_all_common_categories_allowed():
+    for cat in (
+        "Climate and Weather",
+        "Crypto",
+        "Politics",
+        "Sports",
+        "Financials",
+        "Entertainment",
+        "Economics",
+        "World",
+    ):
         assert llm_allowed_for(cat) is True
-
-
-def test_denied_set_is_explicit():
-    assert LLM_DENIED_CATEGORIES == frozenset({"Climate and Weather", "Crypto"})
 
 
 def test_category_prior_routes_to_handlers():
@@ -56,16 +56,20 @@ def _event(category: str, market_ticker: str = "TEST") -> dict:
     }
 
 
-def test_predict_skips_llm_for_denied_category():
+def test_predict_falls_through_to_llm_for_uncategorized_question():
+    """When the typed prior returns None, LLM runs regardless of category."""
     from agent.predict import predict
 
     with patch("agent.predict.get_market", return_value=None), patch(
         "agent.predict.category_prior", return_value=None
-    ), patch("agent.predict.llm_forecast_ensemble") as llm_mock:
+    ), patch(
+        "agent.predict.llm_forecast_ensemble", return_value=(0.35, "hurricane path forecast")
+    ):
         out = predict(_event("Climate and Weather"))
-    assert out["p_yes"] == 0.5
-    assert "LLM gated" in out["rationale"]
-    llm_mock.assert_not_called()
+    # Previously this would have been a hard 0.5; now LLM (with shrinkage) runs.
+    # Speculative α=0.15: 0.35 * 0.85 + 0.5 * 0.15 = 0.3725
+    assert out["p_yes"] == pytest.approx(0.35 * 0.85 + 0.5 * 0.15)
+    assert "LLM" in out["rationale"]
 
 
 def test_predict_uses_llm_for_allowed_category():

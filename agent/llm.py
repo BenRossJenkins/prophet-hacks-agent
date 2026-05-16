@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import statistics
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,13 @@ DEFAULT_MODEL = "claude-opus-4-7"
 MAX_TOKENS = 3000  # bumped from 2000 for the scenarios-then-critique procedure
 TIMEOUT_SECONDS = 45.0
 MAX_WEB_SEARCHES = 3
+
+# Hard wall-clock deadline for the whole ensemble (anchor + parallel
+# fanout). Sized comfortably below the Prophet Arena 10-minute per-event
+# budget (600s) so we ALWAYS have time to assemble a response. If we hit
+# this, we return whatever vendors did respond; a single hanging vendor
+# can't tank our completion rate.
+ENSEMBLE_HARD_DEADLINE_SECONDS = 480.0  # 8 minutes
 
 SYSTEM_PROMPT = """\
 You are an expert forecaster producing calibrated probability estimates.
@@ -461,35 +469,56 @@ def _aggregate_probabilities(
     per_model: list[tuple[str, list[dict] | None]],
     outcomes: list[str],
 ) -> list[dict] | None:
-    """Per-outcome median of vendor-provided distributions.
+    """Mixture-mean aggregation of per-vendor distributions.
 
-    Returns None if fewer than half the vendors supplied a distribution.
-    Normalization is intentional: probabilities are NOT renormalized to 1.0
-    because the contract for top-K questions has them summing to K.
+    Critical that this preserves the sum-to-1 invariant: server contract
+    requires it, and the previous per-outcome MEDIAN didn't (vendors that
+    concentrate mass on different outcomes produced medians summing to
+    much less than 1, which downstream normalization then inflated by
+    multiplying every probability — including outcomes the vendors had
+    explicitly said were ~0).
+
+    Approach:
+      1. For each vendor: fill in 0 for outcomes they didn't mention.
+      2. Renormalize that vendor's distribution to sum=1.
+      3. Per-outcome MEAN across the renormalized vendor distributions.
+    The mean of N probability distributions is itself a probability
+    distribution, so the result sums to 1 by construction.
+
+    Returns None if fewer than half the vendors supplied a usable
+    distribution (so consumer falls back to a synthesized one).
     """
     contributing = [probs for _, probs in per_model if probs]
     if not contributing or len(contributing) < max(1, len(per_model) // 2):
         return None
-    by_outcome: dict[str, list[float]] = {o: [] for o in outcomes}
+
+    normalized: list[dict[str, float]] = []
     for probs in contributing:
+        vendor: dict[str, float] = {o: 0.0 for o in outcomes}
         for entry in probs:
             market = entry.get("market")
-            if market in by_outcome:
+            if market in vendor:
                 try:
-                    by_outcome[market].append(float(entry["probability"]))
+                    vendor[market] = max(0.0, float(entry["probability"]))
                 except (KeyError, ValueError, TypeError):
                     continue
-    aggregated: list[dict] = []
-    for outcome in outcomes:
-        values = by_outcome.get(outcome) or []
-        if not values:
-            # Outcome wasn't covered by any contributor. Skip rather than
-            # invent a probability — the consumer can fall back to uniform.
+        total = sum(vendor.values())
+        if total <= 0:
             continue
-        aggregated.append(
-            {"market": outcome, "probability": statistics.median(values)}
-        )
-    return aggregated or None
+        for o in outcomes:
+            vendor[o] /= total
+        normalized.append(vendor)
+
+    if not normalized:
+        return None
+
+    return [
+        {
+            "market": o,
+            "probability": sum(d[o] for d in normalized) / len(normalized),
+        }
+        for o in outcomes
+    ]
 
 
 def _split_anchor(models: tuple[str, ...]) -> tuple[str | None, tuple[str, ...]]:
@@ -530,6 +559,10 @@ def llm_forecast_ensemble_full(
 
     results: list[tuple[str, tuple[float, list[dict] | None, str]]] = []
     augmented_event = event
+    started_at = time.monotonic()
+
+    def _remaining_budget() -> float:
+        return max(1.0, ENSEMBLE_HARD_DEADLINE_SECONDS - (time.monotonic() - started_at))
 
     # Step 1: search anchor (sequential). Only fires when search is requested.
     if with_web_search:
@@ -555,11 +588,14 @@ def llm_forecast_ensemble_full(
     else:
         other_models = models
 
-    # Step 2: parallel calls for the remaining models (no native search if
-    # we already got context from the anchor).
+    # Step 2: parallel calls for the remaining models. The whole ensemble
+    # is bounded by ENSEMBLE_HARD_DEADLINE_SECONDS — any vendor still
+    # outstanding when the deadline hits is abandoned. This prevents one
+    # hanging vendor from eating our entire per-event budget.
     parallel_search = with_web_search and not results
     if other_models:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(other_models)) as ex:
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(other_models))
+        try:
             futures = {
                 ex.submit(
                     llm_forecast_full,
@@ -569,15 +605,30 @@ def llm_forecast_ensemble_full(
                 ): m
                 for m in other_models
             }
-            for fut in concurrent.futures.as_completed(futures):
-                model = futures[fut]
-                try:
-                    out = fut.result()
-                except Exception as e:
-                    logger.warning("ensemble member %s raised: %s", model, e)
-                    continue
-                if out is not None:
-                    results.append((model, out))
+            try:
+                for fut in concurrent.futures.as_completed(
+                    futures, timeout=_remaining_budget()
+                ):
+                    model = futures[fut]
+                    try:
+                        out = fut.result()
+                    except Exception as e:
+                        logger.warning("ensemble member %s raised: %s", model, e)
+                        continue
+                    if out is not None:
+                        results.append((model, out))
+            except concurrent.futures.TimeoutError:
+                still_running = [m for f, m in futures.items() if not f.done()]
+                logger.warning(
+                    "ensemble deadline hit (%.1fs); abandoning %s",
+                    ENSEMBLE_HARD_DEADLINE_SECONDS,
+                    still_running,
+                )
+        finally:
+            # Don't block the calling thread waiting for hung vendors. Any
+            # outstanding HTTP connections will be torn down by their own
+            # per-vendor timeouts.
+            ex.shutdown(wait=False, cancel_futures=True)
 
     if not results:
         return None

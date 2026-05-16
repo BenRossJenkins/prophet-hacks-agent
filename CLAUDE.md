@@ -18,19 +18,33 @@ Scoring is Brier (lower is better). See `README.md` for setup and
 
 ```
 predict(event):
+  Multi-outcome (3+ outcomes) → straight to LLM ensemble with explicit
+                                 framing; build per-outcome distribution
+                                 summing to 1; skip everything else.
+
+  Binary (2 outcomes):
   1. Fetch Kalshi market by market_ticker.
   2. Derive raw Kalshi price (depth-mid if liquid, else last trade).
-  3. If category in POLYMARKET_CATEGORIES, fetch Polymarket sibling and
-     volume-weighted-blend with the Kalshi price. Polymarket also acts as
-     a fallback when Kalshi has no signal.
-  4. Apply volume-weighted shrinkage toward 0.5.
-  5. If no market signal at all: try category_prior() (NWS for Weather,
-     yfinance for Crypto, Manifold for Politics/Sports/World/Companies).
-  6. Else if category is on the LLM denylist: 0.5.
-  7. Else ensemble[Opus-thinking, GPT-5-mini, Gemini-2.5-flash] with web
-     search → median → two-tier LLM shrinkage → clamp.
-  8. Always clamp output to [0.01, 0.99] (submission contract).
-  9. Log every prediction to PREDICTION_LOG_PATH.
+  3. Tail-anchor triage: if Kalshi vol_24h ≥ $500 AND raw_p outside
+     [0.05, 0.95], return market price directly — skip Polymarket, LLM,
+     shrinkage. (Tails are settled; LLM disagreement costs Brier.)
+  4. If category in POLYMARKET_CATEGORIES, fetch Polymarket sibling and
+     volume-weighted-blend with Kalshi. Also acts as fallback when
+     Kalshi has no signal.
+  5. Apply volume-weighted shrinkage toward 0.5.
+  6. If no market signal at all: try category_prior() (NWS for Weather,
+     yfinance for Crypto, ESPN for Sports, Manifold for Politics/World/
+     Companies + Sports fallback).
+  7. LLM ensemble[Opus-thinking, GPT-5-mini, Gemini-2.5-flash] with
+     shared web search → median → tail-aware two-tier LLM shrinkage.
+     (LLM denylist is currently empty — see priors.py.)
+  8. Market sanity guardrail: if final p deviates >0.30 from a deep
+     liquid Kalshi mid (vol_24h ≥ $100k), anchor 0.6/0.4 toward market.
+  9. Calibration (when GCS table present, binary events only) → clamp.
+  10. Wrap p_yes into {market: outcomes[0], probability: p},
+      {market: outcomes[1], probability: 1-p}. Always clamp p to
+      [0.01, 0.99] per submission contract.
+  11. Log every prediction to PREDICTION_LOG_PATH.
 ```
 
 Module map:
@@ -107,10 +121,13 @@ internally. Additional shrinkage on top would double-count.
    version hard-fails on missing Kalshi credentials for read-only ops;
    GitHub HEAD made them optional. We have an upstream PR open.
 
-5. **LLM ensemble latency is ~25–30 s** with web search across four
-   vendors, bounded by the slowest member. We sit at the per-event 30 s
-   timeout edge. If we see timeouts in production, drop one Anthropic
-   member from `agent.llm.ENSEMBLE_MODELS`.
+5. **Per-event budget is 10 minutes** (confirmed by organizers
+   2026-05-16). Ensemble has a hard deadline `ENSEMBLE_HARD_DEADLINE_SECONDS`
+   = 480s (8 min) — any vendor still outstanding at that point is
+   abandoned and we return whatever partial responses we got. With
+   shared web search (Anthropic anchors then OpenAI/Gemini run in
+   parallel with `search_context` injected) typical latency is
+   30-60 s; the deadline is just safety.
 
 6. **Web search in backtest = leakage.** Settled markets are public
    history; a web-searching LLM finds the actual outcome and looks
@@ -138,17 +155,24 @@ claim a real win.
 ## What NOT to do
 
 - **Don't enable LLM blend on liquid markets** without per-category
-  validation. We deferred this in v2.10 because naive blending of an
-  LLM with a well-calibrated market price usually hurts Brier and our
-  fixture is too weather-heavy to A/B safely.
-- **Don't expand category-specific priors** beyond Weather + Crypto
-  without first proving the existing LLM behavior is broken there.
-  Climate/Crypto are denylisted because of a measured failure;
-  Financials was on the denylist but came off after we saw the actual
-  market shapes (IPO / CEO questions, not price thresholds).
+  validation. Naive blending of an LLM with a well-calibrated market
+  price usually hurts Brier and our weather-heavy fixture is too
+  narrow to A/B safely. The market sanity guardrail in `_forecast`
+  catches the worst cases (deviation > 0.30 from deep liquid Kalshi
+  mid) but is intentionally conservative.
 - **Don't add models to the ensemble** unless they're a new vendor.
   Same-family variants share architecture and training data; they're
   highly correlated and add cost without decorrelating errors.
+- **Don't re-add categories to LLM_DENIED_CATEGORIES** without
+  measured evidence. The denylist was emptied 2026-05-16 because
+  typed priors handle their subcategories, and falling to 0.5 on
+  questions the LLM ensemble could answer (e.g., hurricane track,
+  IPO timing) wastes Brier. Add back only if a specific subcategory
+  regresses on live calibration data.
+- **Don't return naked `p_yes`** as the wire response. The server
+  contract is `probabilities` (sum to 1, markets match outcomes).
+  Every code path goes through `_wrap_binary` or
+  `_normalize_distribution` to produce a valid distribution.
 - **Don't run `git push --force`, `git reset --hard`, or `--no-verify`**
   without explicit approval.
 - **Don't commit `.env`.** It holds live API keys. Already gitignored;

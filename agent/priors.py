@@ -2,36 +2,37 @@
 
 Two responsibilities:
 
-1. **LLM gate.** Some categories (Climate and Weather, Financials) have
-   shown systematic LLM error in backtests because the LLM lacks current
-   external data (forecasts, market prices). For those categories the
-   uniform-prior fallback is *less wrong* than a confident LLM guess.
+1. **LLM gate.** A safety mechanism for categories where running a naked
+   LLM (no domain prior) historically hurt Brier. Currently empty — see
+   the docstring on LLM_DENIED_CATEGORIES below for why.
 
-2. **Category priors.** Phase 4 plugs in category-specific external-data
-   handlers here (e.g., NWS forecasts for weather markets, yfinance
-   quotes for financial markets). When a handler returns a probability,
+2. **Category priors.** Plugs in external-data handlers here (e.g., NWS
+   forecasts for weather markets, yfinance quotes for crypto markets,
+   ESPN moneylines for sports). When a handler returns a probability,
    it takes precedence over the LLM fallback.
 """
 
 from __future__ import annotations
 
-# Categories where the LLM fallback is suppressed.
+# History: an early backtest (95% temperature questions) showed LLM-enabled
+# Brier 0.282 vs LLM-disabled 0.245, so "Climate and Weather" and "Crypto"
+# were gated to 0.5 when the typed prior couldn't handle them. But that
+# fixture was extremely narrow:
 #
-# 2026-05-14 backtest (n=117, 95% Climate and Weather): LLM-enabled Brier 0.282
-# vs LLM-disabled 0.245. The miss was concentrated in p ∈ [0.2, 0.5]: LLM
-# under-predicted YES by 30-50 percentage points because it reasons from base
-# rates without current weather/market data. Same dynamic expected for live
-# crypto price markets — these need a live spot quote, not LLM speculation.
+#   - Temp questions are handled directly by weather_prior (NWS sigmoid).
+#     The denylist only fires when weather_prior returns None — i.e., for
+#     hurricane / named-storm / snowfall questions the prior CAN'T handle.
+#     Hard-capping those at p=0.5 gives Brier ≤ 0.25 even when the LLM
+#     ensemble (with web search) would know the answer.
 #
-# Note: "Financials" is NOT on the denylist — that category is dominated by
-# IPO/CEO-succession markets, which are knowledge/news questions where the
-# LLM with web search performs reasonably.
-LLM_DENIED_CATEGORIES = frozenset(
-    {
-        "Climate and Weather",
-        "Crypto",
-    }
-)
+#   - Same for Crypto: crypto_prior handles spot-vs-threshold via yfinance
+#     + lognormal. The denylist fires on IPO / CEO / regulatory questions
+#     where the LLM with web search performs reasonably well.
+#
+# So the gate is now empty: the typed priors handle what they're good at,
+# and the LLM fallback (with grounded/speculative shrinkage) handles the
+# rest. If a specific subcategory regresses, add it back.
+LLM_DENIED_CATEGORIES: frozenset[str] = frozenset()
 
 
 def llm_allowed_for(category: str) -> bool:
