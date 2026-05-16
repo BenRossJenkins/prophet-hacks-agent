@@ -6,9 +6,11 @@ changes to the agent pipeline.
 
 ## What this is
 
-Solo entry for [Prophet Hacks](https://www.prophethacks.com) — a 30-hour
-AI forecasting/trading hackathon. Build window May 16–17, 2026; live
-evaluation May 17–28 on [Prophet Arena](https://prophetarena.co).
+Two-person entry (Ben + @duckmoll) for [Prophet Hacks](https://www.prophethacks.com),
+a 30-hour AI hackathon. Build window May 16-17, 2026; live evaluation
+May 17-31 on [Prophet Arena](https://prophetarena.co).
+**Forecasting track only** - organizers required teams to pick a single
+track (Forecasting or Trading). All trading-track code was removed.
 Scoring is Brier (lower is better). See `README.md` for setup and
 `SUBMISSION_CONTRACT.md` for the agent interface.
 
@@ -17,27 +19,32 @@ Scoring is Brier (lower is better). See `README.md` for setup and
 ```
 predict(event):
   1. Fetch Kalshi market by market_ticker.
-  2. If no-arb holds AND volume ≥ MIN_VOL_24H AND spread ≤ MAX_SPREAD:
-       depth-weighted midprice → volume-weighted shrinkage → clamp.
-  3. Else if last_price > 0:
-       last trade → volume-weighted shrinkage → clamp.
-  4. Else try category_prior() (NWS for Climate/Weather, yfinance for Crypto).
-  5. Else if category is on the LLM denylist: 0.5.
-  6. Else ensemble[Opus, Sonnet, GPT-5-mini, Gemini-2.5-flash] with web
+  2. Derive raw Kalshi price (depth-mid if liquid, else last trade).
+  3. If category in POLYMARKET_CATEGORIES, fetch Polymarket sibling and
+     volume-weighted-blend with the Kalshi price. Polymarket also acts as
+     a fallback when Kalshi has no signal.
+  4. Apply volume-weighted shrinkage toward 0.5.
+  5. If no market signal at all: try category_prior() (NWS for Weather,
+     yfinance for Crypto, Manifold for Politics/Sports/World/Companies).
+  6. Else if category is on the LLM denylist: 0.5.
+  7. Else ensemble[Opus-thinking, GPT-5-mini, Gemini-2.5-flash] with web
      search → median → two-tier LLM shrinkage → clamp.
-  7. Always clamp output to [0.01, 0.99] (submission contract).
-  8. Log every prediction to PREDICTION_LOG_PATH.
+  8. Always clamp output to [0.01, 0.99] (submission contract).
+  9. Log every prediction to PREDICTION_LOG_PATH.
 ```
 
 Module map:
 
-- `agent/predict.py` — pipeline orchestration + FastAPI app (`/predict`, `/trade`, `/health`)
+- `agent/predict.py` — pipeline orchestration + FastAPI app (`/predict`, `/health`)
 - `agent/kalshi.py` — read-only Kalshi market client
+- `agent/polymarket.py` — Polymarket cross-reference for politics/news markets
 - `agent/priors.py` — category gate + dispatch to typed priors
 - `agent/weather.py` — NWS-backed prior for "Climate and Weather"
 - `agent/financials.py` — yfinance-backed prior for "Crypto"
+- `agent/sports.py` — ESPN moneyline-derived prior for Sports
+- `agent/manifold.py` — Manifold-backed prior for Politics/World/Companies/Sports fallback
 - `agent/llm.py` — multi-vendor LLM ensemble (Anthropic / OpenAI / Google)
-- `agent/trading.py` — buy / sell / hold decisions for the trading track
+- `agent/calibrate.py` — binned calibration table (GCS-backed daily refit)
 - `agent/prediction_log.py` — defensive append-only log of every forecast
 
 ## Conventions
@@ -68,11 +75,13 @@ internally. Additional shrinkage on top would double-count.
 
 ## Gotchas
 
-1. **Local DNS doesn't resolve Kalshi** on this dev machine.
-   `api.elections.kalshi.com` is NXDOMAIN via the system resolver but
-   resolves fine via 8.8.8.8. Live scripts use a `dnspython`-based
-   override (see `scripts/check_kalshi_live.py` for the template).
-   Production hosts have working DNS.
+1. **Local DNS doesn't resolve Kalshi or Polymarket** on this dev machine.
+   `api.elections.kalshi.com` and `gamma-api.polymarket.com` both return
+   NXDOMAIN via the system resolver but resolve fine via 8.8.8.8. Live
+   scripts use a `dnspython`-based override (see `scripts/check_kalshi_live.py`
+   for the template). Production hosts (Cloud Run) have working DNS, so
+   this only affects local smoke tests, not production behavior or unit
+   tests (which mock the HTTP layer).
 
 2. **`expiration_time` ≠ "trading ended".** Kalshi's `expiration_time`
    is the formal calendar deadline; many markets settle days or weeks

@@ -15,14 +15,19 @@ v2.1 — market-anchored with calibration insurance:
 
 from __future__ import annotations
 
+import logging
+import re
 from datetime import UTC, datetime
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
+logger = logging.getLogger(__name__)
+
 from agent.calibrate import apply_calibration, get_calibration_table
 from agent.kalshi import get_market
-from agent.llm import llm_forecast, llm_forecast_ensemble
+from agent.llm import llm_forecast, llm_forecast_ensemble, llm_forecast_ensemble_full
+from agent.polymarket import polymarket_quote
 from agent.prediction_log import log_prediction
 from agent.priors import category_prior, llm_allowed_for
 
@@ -36,10 +41,18 @@ class EventRequest(BaseModel):
     category: str
     rules: str | None = None
     close_time: str
+    outcomes: list[str] | None = None
+    resolved_outcome: dict | None = None
+
+
+class MarketProbability(BaseModel):
+    market: str
+    probability: float = Field(ge=0.0, le=1.0)
 
 
 class PredictionResponse(BaseModel):
     p_yes: float = Field(ge=0.01, le=0.99)
+    probabilities: list[MarketProbability] | None = None
     rationale: str
 
 
@@ -72,6 +85,23 @@ APPLY_STALENESS = False
 # the model did real research vs speculating from base rates.
 LLM_SHRINK_GROUNDED = 0.05
 LLM_SHRINK_SPECULATIVE = 0.15
+
+# Polymarket cross-reference. Categories where a Polymarket sibling is most
+# likely to exist + add signal. Weather/Crypto/Sports are excluded: Weather
+# has no Poly equivalent, Crypto has its own quantitative prior, and Sports
+# uses pre-game odds (added in the sports prior). Politics is the headline
+# use-case.
+POLYMARKET_CATEGORIES = frozenset(
+    {
+        "Politics",
+        "Elections",
+        "World",
+        "Companies",
+        "Financials",
+        "Entertainment",
+        "Economics",
+    }
+)
 _LLM_GROUNDED_MARKERS = (
     "search",
     "according to",
@@ -82,6 +112,72 @@ _LLM_GROUNDED_MARKERS = (
     "polls",
     "polling",
 )
+
+
+def _is_multi_outcome(event: EventRequest) -> bool:
+    """True if the event has 3+ outcomes (e.g. Eurovision, award nominees)."""
+    return event.outcomes is not None and len(event.outcomes) > 2
+
+
+_TOP_K_PATTERN = re.compile(r"top\s+(\d+)|finish.+top\s+(\d+)", re.IGNORECASE)
+
+
+def _estimate_winners_count(event: EventRequest) -> int:
+    """How many positive outcomes are expected, given the question phrasing.
+
+    Returns 1 by default (single-winner: "Who will win X?"). Returns K when
+    the title clearly says "top K". For ordinal/bucket questions (e.g.
+    "At least N million views") the resolution rule picks exactly one
+    bucket, so K=1 there too.
+    """
+    title = event.title or ""
+    rules = event.rules or ""
+    m = _TOP_K_PATTERN.search(title) or _TOP_K_PATTERN.search(rules)
+    if m:
+        for group in m.groups():
+            if group:
+                try:
+                    k = int(group)
+                except ValueError:
+                    continue
+                if 1 <= k <= 20:
+                    return k
+    return 1
+
+
+def _uniform_prior(event: EventRequest) -> float:
+    """k/N uniform prior for outcomes[0] — assumes each outcome equally likely."""
+    if not event.outcomes:
+        return 0.5
+    n = len(event.outcomes)
+    if n <= 0:
+        return 0.5
+    k = _estimate_winners_count(event)
+    p = k / n
+    return max(0.01, min(0.99, p))
+
+
+# Multi-outcome LLM shrinkage: we pull aggressively toward the uniform prior
+# because (a) overconfidence costs more across many options, (b) LLMs are
+# generally less reliable when answering "which of these 35 things" than
+# binary yes/no. α=0.30 means a confident LLM 0.90 against a 0.143 uniform
+# prior gets shrunk to 0.90*0.70 + 0.143*0.30 = 0.673. Still meaningful, but
+# not catastrophic if wrong.
+MULTI_LLM_SHRINK = 0.30
+
+
+# Tail-market triage: when Kalshi is confidently at one tail AND backed by
+# enough volume to trust, return the market price directly. Skip Polymarket
+# blend, skip LLM, skip shrinkage.
+#
+# Rationale (per Prophet Arena paper + author write-up): tail markets have
+# already aggregated the consensus information. LLM disagreement at the
+# tails almost always hurts Brier — the squared-error penalty for being
+# wrong at 0.05 vs the truth at 1.0 is brutal. Also a major cost savings.
+TAIL_LOW = 0.05
+TAIL_HIGH = 0.95
+TAIL_MIN_VOL_24H = 500.0  # USD — high enough that the price reflects real consensus,
+                          # not a $5 thin-book accident.
 
 
 def _f(market: dict, key: str) -> float:
@@ -194,6 +290,62 @@ def _market_implied_prob(
     )
 
 
+def _kalshi_volume_weight(market: dict | None) -> float:
+    """Depth proxy for Kalshi side of the cross-market blend (24h volume in USD)."""
+    if market is None:
+        return 0.0
+    return _f(market, "volume_24h_fp")
+
+
+def _blend_with_polymarket(
+    event: EventRequest,
+    kalshi_market: dict | None,
+    kalshi_p: float | None,
+    kalshi_rationale: str,
+) -> tuple[float | None, str]:
+    """If a Polymarket sibling exists, fold it into the price.
+
+    Three cases:
+      - Both books have signal: volume-weighted average of the two prices.
+      - Only Polymarket has signal (Kalshi illiquid/missing): use Poly price.
+      - Neither: pass kalshi_p (which may itself be None) through unchanged.
+
+    Returns (p_or_none, rationale). When category isn't on the Polymarket
+    allowlist or no usable Poly match exists, this is a pass-through.
+    """
+    if event.category not in POLYMARKET_CATEGORIES:
+        return kalshi_p, kalshi_rationale
+
+    try:
+        poly = polymarket_quote(event.model_dump())
+    except Exception as e:  # poly is best-effort, never block on its failures
+        logger.warning("polymarket lookup raised: %s", e)
+        poly = None
+
+    if poly is None:
+        return kalshi_p, kalshi_rationale
+
+    poly_p, poly_weight, poly_rationale = poly
+
+    if kalshi_p is None:
+        return poly_p, f"polymarket-only ({poly_rationale}); kalshi: {kalshi_rationale}"
+
+    kalshi_weight = _kalshi_volume_weight(kalshi_market)
+    total_weight = kalshi_weight + poly_weight
+    if total_weight <= 0:
+        # Both books exist but neither has measurable depth — straight average.
+        blended = (kalshi_p + poly_p) / 2
+        weight_note = "equal-weight"
+    else:
+        blended = (kalshi_p * kalshi_weight + poly_p * poly_weight) / total_weight
+        weight_note = (
+            f"vol-weighted (kalshi=${kalshi_weight:.0f} poly=${poly_weight:.0f})"
+        )
+    return blended, (
+        f"blend {blended:.3f} {weight_note}; kalshi: {kalshi_rationale}; {poly_rationale}"
+    )
+
+
 def _llm_shrink_alpha(rationale: str) -> float:
     """Pick LLM shrinkage strength based on whether it appears data-grounded."""
     rationale_lower = rationale.lower()
@@ -240,17 +392,98 @@ def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
     )
 
 
+def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
+    """Forecast for events with 3+ outcomes.
+
+    The market-anchor / sportsbook / manifold tiers are all designed for 2-
+    outcome binary questions, so they're skipped entirely. Go straight to
+    the LLM ensemble with explicit framing ('p_yes is P(outcomes[0] in
+    resolved set)'), aggregate per-outcome probabilities across vendors,
+    and shrink p_yes toward the k/N uniform prior.
+    """
+    event_d = event.model_dump()
+    prior = _uniform_prior(event)
+    n_out = len(event.outcomes or [])
+    k = _estimate_winners_count(event)
+
+    out = llm_forecast_ensemble_full(event_d)
+    if out is None:
+        return PredictionResponse(
+            p_yes=max(0.01, min(0.99, prior)),
+            rationale=(
+                f"multi-outcome ({n_out} options, top-{k}); LLM unavailable; "
+                f"uniform prior {prior:.3f}"
+            ),
+        )
+    raw_p, probabilities, llm_rationale = out
+
+    # Shrink toward the uniform prior, not toward 0.5 — for a 35-option
+    # question, 0.5 is itself an absurd answer.
+    shrunk = (1 - MULTI_LLM_SHRINK) * raw_p + MULTI_LLM_SHRINK * prior
+    shrunk = max(0.01, min(0.99, shrunk))
+
+    probs_payload: list[MarketProbability] | None = None
+    if probabilities:
+        # Clamp each per-outcome probability to [0, 1] but DON'T renormalize:
+        # top-K questions have probabilities summing to ~K, not 1.
+        probs_payload = [
+            MarketProbability(
+                market=p["market"], probability=max(0.0, min(1.0, p["probability"]))
+            )
+            for p in probabilities
+        ]
+
+    return PredictionResponse(
+        p_yes=shrunk,
+        probabilities=probs_payload,
+        rationale=(
+            f"multi-outcome ({n_out} options, top-{k}, uniform={prior:.3f}); "
+            f"raw={raw_p:.3f} α={MULTI_LLM_SHRINK} → {shrunk:.3f}; {llm_rationale}"
+        ),
+    )
+
+
 def _forecast(event: EventRequest) -> PredictionResponse:
+    if _is_multi_outcome(event):
+        return _multi_outcome_forecast(event)
+
     market = get_market(event.market_ticker)
+
     if market is None:
+        # Kalshi fetch failed entirely. Try Polymarket as an alternative
+        # market-anchor before reaching for priors / LLM.
+        poly_p, poly_rationale = _blend_with_polymarket(
+            event, None, None, f"kalshi fetch failed for {event.market_ticker}"
+        )
+        if poly_p is not None:
+            p = _shrink_and_clamp(poly_p, alpha=MIN_SHRINK_ALPHA)
+            return PredictionResponse(p_yes=p, rationale=poly_rationale)
         return _llm_fallback(event, reason=f"kalshi fetch failed for {event.market_ticker}")
 
     arb_violated = _no_arb_violated(market)
     raw_p, rationale = _market_implied_prob(market, arb_violated=arb_violated)
+    vol_24h = _f(market, "volume_24h_fp")
+
+    # Tail-market triage: a confident high-volume Kalshi price already
+    # reflects market consensus. LLM disagreement here almost always hurts
+    # Brier. Skip everything downstream and return the price directly.
+    if (
+        raw_p is not None
+        and vol_24h >= TAIL_MIN_VOL_24H
+        and (raw_p < TAIL_LOW or raw_p > TAIL_HIGH)
+    ):
+        p = max(0.01, min(0.99, raw_p))
+        return PredictionResponse(
+            p_yes=p,
+            rationale=f"tail-anchor {p:.3f} (vol24h=${vol_24h:.0f}); {rationale}",
+        )
+
+    # Cross-reference Polymarket when category is on the allowlist.
+    raw_p, rationale = _blend_with_polymarket(event, market, raw_p, rationale)
+
     if raw_p is None:
         return _llm_fallback(event, reason=rationale)
 
-    vol_24h = _f(market, "volume_24h_fp")
     alpha = _shrink_alpha(vol_24h)
 
     if APPLY_STALENESS:
@@ -300,13 +533,6 @@ async def predict_endpoint(event: EventRequest) -> PredictionResponse:
     resp = _maybe_calibrate(resp)
     log_prediction(event.model_dump(), resp.p_yes, resp.rationale)
     return resp
-
-
-@app.post("/trade")
-async def trade_endpoint(event: EventRequest) -> dict:
-    from agent.trading import decide
-
-    return decide(event.model_dump()).to_dict()
 
 
 @app.get("/health")

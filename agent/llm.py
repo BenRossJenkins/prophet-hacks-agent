@@ -77,12 +77,66 @@ def _build_user_prompt(event: dict) -> str:
         parts.append(f"Category: {category}")
     if close_time := event.get("close_time"):
         parts.append(f"Resolution deadline: {close_time}")
+
+    # Injected by the shared-search ensemble: another model has already run
+    # web search; their reasoning becomes additional context here. Treat as
+    # ONE source — corroborate with your own knowledge, don't blindly defer.
+    if search_context := event.get("search_context"):
+        parts.append(
+            "\n=== Research from a sibling model (treat as one source — "
+            "corroborate, don't defer blindly) ===\n"
+            f"{search_context}\n"
+            "=== End sibling research ==="
+        )
+
+    outcomes = event.get("outcomes") or []
+    if isinstance(outcomes, list) and len(outcomes) > 2:
+        # Multi-outcome: anchor the question to outcomes[0] explicitly so the
+        # model knows what "YES" means. Without this it will guess at the
+        # question's framing and may answer the wrong thing entirely.
+        first = outcomes[0]
+        n = len(outcomes)
+        parts.append(
+            f"\nThis is a {n}-option question with outcomes:\n"
+            f"  {outcomes}\n"
+            f"YOUR p_yes IS THE PROBABILITY THAT '{first}' IS AMONG THE RESOLVED "
+            f"POSITIVE OUTCOMES — not the probability of any other option. If the "
+            f"question asks for a top-K winner set, p_yes is P('{first}' makes "
+            f"that set). Uniform prior across {n} equally-likely options would "
+            f"be ~{1/n:.3f}; a top-K question with K winners has uniform "
+            f"prior ~K/{n}."
+        )
+        parts.append(
+            "Additionally: include in the JSON a `probabilities` array of "
+            f"{{market, probability}} entries — one per outcome — that sums to "
+            "the expected number of positive outcomes (1.0 for single-winner, "
+            "K for top-K). This is optional but improves scoring when the "
+            "server supports multi-class Brier."
+        )
     parts.append("\nProvide your probability estimate as JSON.")
     return "\n".join(parts)
 
 
 def parse_response(text: str) -> tuple[float, str] | None:
-    """Pull a JSON forecast out of the model's response. None on any failure."""
+    """Pull a JSON forecast out of the model's response. None on any failure.
+
+    For backwards compatibility with existing callers, this returns only
+    (p_yes, rationale). Callers that need the multi-outcome distribution
+    should use `parse_response_full` instead.
+    """
+    out = parse_response_full(text)
+    if out is None:
+        return None
+    return out[0], out[2]
+
+
+def parse_response_full(text: str) -> tuple[float, list[dict] | None, str] | None:
+    """Parse the model's JSON output into (p_yes, probabilities, rationale).
+
+    `probabilities` is the optional per-outcome distribution: a list of
+    {"market": str, "probability": float} dicts. None if the model didn't
+    provide one (binary questions, or model declined).
+    """
     s = (text or "").strip()
     if s.startswith("```"):
         s = re.sub(r"^```(?:json)?\s*", "", s)
@@ -90,7 +144,9 @@ def parse_response(text: str) -> tuple[float, str] | None:
     try:
         data = json.loads(s)
     except json.JSONDecodeError:
-        match = re.search(r'\{[^{}]*"p_yes"[^{}]*\}', s, re.DOTALL)
+        # Fallback: scan for a {...} block containing "p_yes". Use a more
+        # forgiving regex that tolerates nested {} (for probabilities lists).
+        match = re.search(r'\{.*"p_yes".*\}', s, re.DOTALL)
         if not match:
             return None
         try:
@@ -104,8 +160,30 @@ def parse_response(text: str) -> tuple[float, str] | None:
     if not (0.0 <= p <= 1.0):
         return None
     p = max(0.01, min(0.99, p))
+
+    probabilities = None
+    raw_probs = data.get("probabilities")
+    if isinstance(raw_probs, list) and raw_probs:
+        parsed: list[dict] = []
+        for entry in raw_probs:
+            if not isinstance(entry, dict):
+                continue
+            market = entry.get("market") or entry.get("outcome")
+            prob = entry.get("probability") or entry.get("p")
+            if market is None or prob is None:
+                continue
+            try:
+                prob_f = float(prob)
+            except (ValueError, TypeError):
+                continue
+            if not (0.0 <= prob_f <= 1.0):
+                continue
+            parsed.append({"market": str(market), "probability": prob_f})
+        if parsed:
+            probabilities = parsed
+
     rationale = str(data.get("rationale", "")).strip()
-    return p, rationale or "LLM forecast"
+    return p, probabilities, rationale or "LLM forecast"
 
 
 def _vendor_for(model: str) -> str:
@@ -164,7 +242,9 @@ def _anthropic_extract_text(content_blocks) -> str:
 THINKING_BUDGET_TOKENS = 1500   # extended-thinking allotment
 
 
-def _anthropic_forecast(event: dict, model: str, with_web_search: bool) -> tuple[float, str] | None:
+def _anthropic_forecast_full(
+    event: dict, model: str, with_web_search: bool
+) -> tuple[float, list[dict] | None, str] | None:
     client = _get_anthropic_client()
     if client is None:
         return None
@@ -181,9 +261,6 @@ def _anthropic_forecast(event: dict, model: str, with_web_search: bool) -> tuple
         "messages": [{"role": "user", "content": _build_user_prompt(event)}],
     }
     if thinking_enabled:
-        # Anthropic's adaptive-thinking API (Opus 4.7+). The model decides
-        # how much to think; `effort=high` lets it use the budget when
-        # the prompt genuinely needs multi-step reasoning.
         kwargs["thinking"] = {"type": "adaptive"}
         kwargs["output_config"] = {"effort": "high"}
     if with_web_search:
@@ -194,7 +271,12 @@ def _anthropic_forecast(event: dict, model: str, with_web_search: bool) -> tuple
     except Exception as e:
         logger.warning("Anthropic call failed (%s): %s", model, e)
         return None
-    return parse_response(text)
+    return parse_response_full(text)
+
+
+def _anthropic_forecast(event: dict, model: str, with_web_search: bool) -> tuple[float, str] | None:
+    out = _anthropic_forecast_full(event, model, with_web_search)
+    return None if out is None else (out[0], out[2])
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +303,9 @@ def _get_openai_client():
     return _openai_client
 
 
-def _openai_forecast(event: dict, model: str, with_web_search: bool) -> tuple[float, str] | None:
+def _openai_forecast_full(
+    event: dict, model: str, with_web_search: bool
+) -> tuple[float, list[dict] | None, str] | None:
     client = _get_openai_client()
     if client is None:
         return None
@@ -240,7 +324,12 @@ def _openai_forecast(event: dict, model: str, with_web_search: bool) -> tuple[fl
     except Exception as e:
         logger.warning("OpenAI call failed (%s): %s", model, e)
         return None
-    return parse_response(text)
+    return parse_response_full(text)
+
+
+def _openai_forecast(event: dict, model: str, with_web_search: bool) -> tuple[float, str] | None:
+    out = _openai_forecast_full(event, model, with_web_search)
+    return None if out is None else (out[0], out[2])
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +356,9 @@ def _get_gemini_client():
     return _gemini_client
 
 
-def _gemini_forecast(event: dict, model: str, with_web_search: bool) -> tuple[float, str] | None:
+def _gemini_forecast_full(
+    event: dict, model: str, with_web_search: bool
+) -> tuple[float, list[dict] | None, str] | None:
     client = _get_gemini_client()
     if client is None:
         return None
@@ -287,7 +378,12 @@ def _gemini_forecast(event: dict, model: str, with_web_search: bool) -> tuple[fl
     except Exception as e:
         logger.warning("Gemini call failed (%s): %s", model, e)
         return None
-    return parse_response(text)
+    return parse_response_full(text)
+
+
+def _gemini_forecast(event: dict, model: str, with_web_search: bool) -> tuple[float, str] | None:
+    out = _gemini_forecast_full(event, model, with_web_search)
+    return None if out is None else (out[0], out[2])
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +403,22 @@ def llm_forecast(
         return _openai_forecast(event, model, with_web_search)
     if vendor == "google":
         return _gemini_forecast(event, model, with_web_search)
+    logger.warning("Unknown vendor for model %s", model)
+    return None
+
+
+def llm_forecast_full(
+    event: dict, *, model: str | None = None, with_web_search: bool = True
+) -> tuple[float, list[dict] | None, str] | None:
+    """Call a single LLM and return (p_yes, probabilities, rationale) or None."""
+    model = model or os.environ.get("FORECAST_MODEL", DEFAULT_MODEL)
+    vendor = _vendor_for(model)
+    if vendor == "anthropic":
+        return _anthropic_forecast_full(event, model, with_web_search)
+    if vendor == "openai":
+        return _openai_forecast_full(event, model, with_web_search)
+    if vendor == "google":
+        return _gemini_forecast_full(event, model, with_web_search)
     logger.warning("Unknown vendor for model %s", model)
     return None
 
@@ -333,27 +445,139 @@ ENSEMBLE_MODELS = (
 def llm_forecast_ensemble(
     event: dict, *, models: tuple[str, ...] = ENSEMBLE_MODELS, with_web_search: bool = True
 ) -> tuple[float, str] | None:
-    """Run several models in parallel, return median p_yes + concatenated rationales."""
+    """Run several models, return median p_yes + concatenated rationales.
+
+    Backwards-compatible 2-tuple wrapper around llm_forecast_ensemble_full.
+    Uses the shared-search behavior internally — one search-grounded
+    Anthropic call feeds its findings to OpenAI + Gemini.
+    """
+    out = llm_forecast_ensemble_full(event, models=models, with_web_search=with_web_search)
+    if out is None:
+        return None
+    return out[0], out[2]
+
+
+def _aggregate_probabilities(
+    per_model: list[tuple[str, list[dict] | None]],
+    outcomes: list[str],
+) -> list[dict] | None:
+    """Per-outcome median of vendor-provided distributions.
+
+    Returns None if fewer than half the vendors supplied a distribution.
+    Normalization is intentional: probabilities are NOT renormalized to 1.0
+    because the contract for top-K questions has them summing to K.
+    """
+    contributing = [probs for _, probs in per_model if probs]
+    if not contributing or len(contributing) < max(1, len(per_model) // 2):
+        return None
+    by_outcome: dict[str, list[float]] = {o: [] for o in outcomes}
+    for probs in contributing:
+        for entry in probs:
+            market = entry.get("market")
+            if market in by_outcome:
+                try:
+                    by_outcome[market].append(float(entry["probability"]))
+                except (KeyError, ValueError, TypeError):
+                    continue
+    aggregated: list[dict] = []
+    for outcome in outcomes:
+        values = by_outcome.get(outcome) or []
+        if not values:
+            # Outcome wasn't covered by any contributor. Skip rather than
+            # invent a probability — the consumer can fall back to uniform.
+            continue
+        aggregated.append(
+            {"market": outcome, "probability": statistics.median(values)}
+        )
+    return aggregated or None
+
+
+def _split_anchor(models: tuple[str, ...]) -> tuple[str | None, tuple[str, ...]]:
+    """Pick the Anthropic model as the search-grounding anchor.
+
+    Returns (anchor_model, other_models). Falls back to None when no
+    Anthropic model is in the ensemble — caller should use parallel-all path.
+    """
+    anchor = next((m for m in models if _vendor_for(m) == "anthropic"), None)
+    others = tuple(m for m in models if m != anchor) if anchor else models
+    return anchor, others
+
+
+def llm_forecast_ensemble_full(
+    event: dict,
+    *,
+    models: tuple[str, ...] = ENSEMBLE_MODELS,
+    with_web_search: bool = True,
+) -> tuple[float, list[dict] | None, str] | None:
+    """Multi-outcome aware ensemble. Returns (p_yes, probabilities, rationale).
+
+    When `with_web_search=True` and the ensemble contains an Anthropic model,
+    we run Anthropic FIRST with web_search enabled, then run the other
+    vendors in parallel with web_search OFF but the Anthropic rationale
+    injected as `search_context`. This shares one set of search findings
+    across N models — meaningful cost + latency win.
+    """
     if not models:
         return None
-    if len(models) == 1:
-        return llm_forecast(event, model=models[0], with_web_search=with_web_search)
+    outcomes = event.get("outcomes") or []
+    is_multi = isinstance(outcomes, list) and len(outcomes) > 2
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(models)) as ex:
-        futures = {
-            ex.submit(llm_forecast, event, model=m, with_web_search=with_web_search): m
-            for m in models
-        }
-        results: list[tuple[str, tuple[float, str]]] = []
-        for fut in concurrent.futures.as_completed(futures):
-            model = futures[fut]
-            try:
-                out = fut.result()
-            except Exception as e:
-                logger.warning("ensemble member %s raised: %s", model, e)
-                continue
-            if out is not None:
-                results.append((model, out))
+    if len(models) == 1:
+        out = llm_forecast_full(event, model=models[0], with_web_search=with_web_search)
+        if out is None:
+            return None
+        return out
+
+    results: list[tuple[str, tuple[float, list[dict] | None, str]]] = []
+    augmented_event = event
+
+    # Step 1: search anchor (sequential). Only fires when search is requested.
+    if with_web_search:
+        anchor_model, other_models = _split_anchor(models)
+        if anchor_model is not None:
+            anchor_out = llm_forecast_full(
+                event, model=anchor_model, with_web_search=True
+            )
+            if anchor_out is not None:
+                results.append((anchor_model, anchor_out))
+                # Share findings with the parallel callers. We strip the
+                # JSON tail from rationale so the prompt stays clean.
+                augmented_event = dict(event)
+                augmented_event["search_context"] = anchor_out[2]
+            else:
+                logger.warning(
+                    "shared-search anchor (%s) failed; falling back to all-parallel",
+                    anchor_model,
+                )
+                other_models = models  # nothing was contributed, redo all
+        else:
+            other_models = models
+    else:
+        other_models = models
+
+    # Step 2: parallel calls for the remaining models (no native search if
+    # we already got context from the anchor).
+    parallel_search = with_web_search and not results
+    if other_models:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(other_models)) as ex:
+            futures = {
+                ex.submit(
+                    llm_forecast_full,
+                    augmented_event,
+                    model=m,
+                    with_web_search=parallel_search,
+                ): m
+                for m in other_models
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                model = futures[fut]
+                try:
+                    out = fut.result()
+                except Exception as e:
+                    logger.warning("ensemble member %s raised: %s", model, e)
+                    continue
+                if out is not None:
+                    results.append((model, out))
 
     if not results:
         return None
@@ -361,15 +585,23 @@ def llm_forecast_ensemble(
     p_values = [out[0] for _, out in results]
     p_median = statistics.median(p_values)
 
+    aggregated_probs = None
+    if is_multi:
+        aggregated_probs = _aggregate_probabilities(
+            [(m, out[1]) for m, out in results], outcomes
+        )
+
     def _short(model: str) -> str:
         parts = model.split("-")
         return parts[1] if len(parts) > 1 else model
 
     parts = [f"{_short(m)}={out[0]:.3f}" for m, out in results]
     rationale = f"ensemble[{','.join(parts)}] → median={p_median:.3f}; " + "; ".join(
-        f"{m}: {out[1][:120]}" for m, out in results
+        f"{m}: {out[2][:120]}" for m, out in results
     )
-    return p_median, rationale
+    if aggregated_probs is not None:
+        rationale += f"; distribution over {len(aggregated_probs)} outcomes"
+    return p_median, aggregated_probs, rationale
 
 
 # Backwards-compat: the old internal helper name. Tests use _extract_text.

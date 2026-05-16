@@ -25,7 +25,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 import backtest as bt  # noqa: E402
 
 import agent.predict as P  # noqa: E402
-import agent.trading as T  # noqa: E402
 import agent.weather as W  # noqa: E402
 
 

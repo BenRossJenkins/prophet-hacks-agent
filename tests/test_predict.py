@@ -396,6 +396,180 @@ def test_predict_does_not_apply_staleness_by_default():
     assert "stale book" not in out["rationale"]
 
 
+# ---- Tail-market triage -----------------------------------------------
+
+
+def _tail_high_market(vol: float = 1000.0) -> dict:
+    return {
+        "yes_bid_dollars": "0.96",
+        "yes_ask_dollars": "0.98",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.02",
+        "no_ask_dollars": "0.04",
+        "last_price_dollars": "0.97",
+        "volume_24h_fp": str(vol),
+    }
+
+
+def _tail_low_market(vol: float = 1000.0) -> dict:
+    return {
+        "yes_bid_dollars": "0.02",
+        "yes_ask_dollars": "0.04",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.96",
+        "no_ask_dollars": "0.98",
+        "last_price_dollars": "0.03",
+        "volume_24h_fp": str(vol),
+    }
+
+
+def test_tail_anchor_high_skips_llm_and_polymarket():
+    e = _event()
+    e["category"] = "Politics"  # on the Polymarket allowlist
+    with patch("agent.predict.get_market", return_value=_tail_high_market(vol=1000)), patch(
+        "agent.predict.polymarket_quote"
+    ) as poly_mock, patch("agent.predict.llm_forecast_ensemble") as llm_mock:
+        out = predict(e)
+    poly_mock.assert_not_called()
+    llm_mock.assert_not_called()
+    # depth-mid = 0.97 (equal sizes), returned WITHOUT shrinkage.
+    assert out["p_yes"] == pytest.approx(0.97)
+    assert "tail-anchor" in out["rationale"]
+
+
+def test_tail_anchor_low_skips_llm():
+    with patch("agent.predict.get_market", return_value=_tail_low_market(vol=1000)), patch(
+        "agent.predict.llm_forecast_ensemble"
+    ) as llm_mock:
+        out = predict(_event())
+    llm_mock.assert_not_called()
+    assert out["p_yes"] == pytest.approx(0.03)
+    assert "tail-anchor" in out["rationale"]
+
+
+def test_tail_anchor_requires_minimum_volume():
+    # Same prices but volume below TAIL_MIN_VOL_24H → triage skipped, normal
+    # path shrinks toward 0.5.
+    from agent.predict import TAIL_MIN_VOL_24H
+
+    market = _tail_high_market(vol=TAIL_MIN_VOL_24H - 100)
+    with patch("agent.predict.get_market", return_value=market):
+        out = predict(_event())
+    # Should NOT be the raw market price — should be shrunk.
+    assert "tail-anchor" not in out["rationale"]
+    assert out["p_yes"] < 0.97  # shrunk away from raw
+
+
+def test_tail_anchor_does_not_engage_in_mid_range():
+    # Market at 0.50 with high vol: NOT a tail, normal pipeline runs.
+    market = {
+        "yes_bid_dollars": "0.49",
+        "yes_ask_dollars": "0.51",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.49",
+        "no_ask_dollars": "0.51",
+        "last_price_dollars": "0.50",
+        "volume_24h_fp": "5000",
+    }
+    with patch("agent.predict.get_market", return_value=market):
+        out = predict(_event())
+    assert "tail-anchor" not in out["rationale"]
+
+
+# ---- Polymarket blend --------------------------------------------------
+
+
+def _politics_event() -> dict:
+    e = _event()
+    e["category"] = "Politics"
+    return e
+
+
+def test_predict_blends_kalshi_and_polymarket_volume_weighted():
+    market = {
+        "yes_bid_dollars": "0.30",
+        "yes_ask_dollars": "0.32",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.68",
+        "no_ask_dollars": "0.70",
+        "last_price_dollars": "0.31",
+        "volume_24h_fp": "1000",  # kalshi $1000
+    }
+    with patch("agent.predict.get_market", return_value=market), patch(
+        "agent.predict.polymarket_quote",
+        return_value=(0.50, 9000.0, "poly p=0.500 vol24h=$9000 (match=0.80)"),
+    ):
+        out = predict(_politics_event())
+    # Kalshi p≈0.31 weight $1000, poly p=0.50 weight $9000.
+    # Blended ≈ (0.31 * 1000 + 0.50 * 9000) / 10000 = 0.481
+    # Then shrunk by α from $1000 vol.
+    assert 0.40 < out["p_yes"] < 0.50
+    assert "blend" in out["rationale"]
+    assert "poly" in out["rationale"].lower()
+
+
+def test_predict_uses_polymarket_when_kalshi_illiquid():
+    # Kalshi book with no signal at all → polymarket should rescue.
+    market = {
+        "yes_bid_dollars": "0",
+        "yes_ask_dollars": "0",
+        "last_price_dollars": "0",
+        "volume_24h_fp": "0",
+    }
+    with patch("agent.predict.get_market", return_value=market), patch(
+        "agent.predict.polymarket_quote",
+        return_value=(0.72, 5000.0, "poly p=0.720 vol24h=$5000 (match=0.90)"),
+    ):
+        out = predict(_politics_event())
+    assert 0.70 < out["p_yes"] < 0.75
+    assert "polymarket-only" in out["rationale"].lower()
+
+
+def test_predict_uses_polymarket_when_kalshi_fetch_fails():
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.polymarket_quote",
+        return_value=(0.65, 3000.0, "poly p=0.650 vol24h=$3000 (match=0.75)"),
+    ):
+        out = predict(_politics_event())
+    assert 0.63 < out["p_yes"] < 0.67
+    assert "polymarket-only" in out["rationale"].lower()
+
+
+def test_predict_skips_polymarket_for_off_allowlist_categories():
+    # Test category isn't on POLYMARKET_CATEGORIES, so poly should never be called.
+    market = {
+        "yes_bid_dollars": "0.40",
+        "yes_ask_dollars": "0.42",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.58",
+        "no_ask_dollars": "0.60",
+        "last_price_dollars": "0.41",
+        "volume_24h_fp": "1000",
+    }
+    with patch("agent.predict.get_market", return_value=market), patch(
+        "agent.predict.polymarket_quote"
+    ) as poly_mock:
+        predict(_event())  # category="Test", not on allowlist
+    poly_mock.assert_not_called()
+
+
+def test_predict_falls_through_when_kalshi_fails_and_poly_no_match():
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.polymarket_quote", return_value=None
+    ), patch("agent.predict.category_prior", return_value=None), patch(
+        "agent.predict.llm_forecast_ensemble", return_value=(0.4, "base rate")
+    ):
+        out = predict(_politics_event())
+    # Speculative LLM shrink: 0.4 * 0.85 + 0.5 * 0.15 = 0.415
+    assert out["p_yes"] == pytest.approx(0.4 * 0.85 + 0.5 * 0.15)
+    assert "LLM" in out["rationale"]
+
+
 def test_predict_output_always_in_contract_range():
     market = {
         "yes_bid_dollars": "0.99",

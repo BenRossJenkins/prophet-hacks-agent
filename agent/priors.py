@@ -54,8 +54,20 @@ def category_prior(event: dict) -> tuple[float, str] | None:
         from agent.financials import crypto_prior
 
         return crypto_prior(event)
-    if category in {"Politics", "Sports", "Elections", "World", "Companies"}:
-        # Manifold has wide coverage of political/sporting/world/company events.
+    if category == "Sports":
+        # Sportsbook moneyline (ESPN) is the canonical answer for individual
+        # game markets. Falls through to Manifold for season-long / tournament
+        # questions ESPN's scoreboard doesn't cover.
+        from agent.sports import sports_prior
+
+        result = sports_prior(event)
+        if result is not None:
+            return result
+        from agent.manifold import manifold_prior
+
+        return manifold_prior(event)
+    if category in {"Politics", "Elections", "World", "Companies"}:
+        # Manifold has wide coverage of political/world/company events.
         # If no match is found, we return None and fall through to the LLM.
         from agent.manifold import manifold_prior
 
