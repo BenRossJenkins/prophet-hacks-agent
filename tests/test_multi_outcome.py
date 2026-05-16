@@ -243,6 +243,8 @@ def test_predict_multi_outcome_skips_market_anchor():
     eurovision_outcomes = [f"Country{i}" for i in range(35)]
     event = _multi_event(eurovision_outcomes, title="Top 5 acts at Eurovision 2026?")
     with patch("agent.predict.get_market") as market_mock, patch(
+        "agent.predict.polymarket_event_distribution", return_value=None
+    ), patch(
         "agent.predict.llm_forecast_ensemble_full",
         return_value=(0.20, None, "raw rationale"),
     ):
@@ -253,6 +255,30 @@ def test_predict_multi_outcome_skips_market_anchor():
     assert out["p_yes"] == pytest.approx(0.20 * 0.70 + (5 / 35) * 0.30)
     assert "multi-outcome" in out["rationale"]
     assert "top-5" in out["rationale"]
+
+
+def test_predict_multi_outcome_uses_polymarket_event_when_available():
+    """Polymarket multi-outcome event with sufficient coverage replaces LLM-only path."""
+    outcomes = ["Albania", "France", "Sweden", "Italy"]
+    event = _multi_event(outcomes, title="Who will win Eurovision 2026?")
+    poly_probs = [
+        {"market": "Albania", "probability": 0.05},
+        {"market": "France",  "probability": 0.30},
+        {"market": "Sweden",  "probability": 0.20},
+        {"market": "Italy",   "probability": 0.15},
+    ]
+    with patch(
+        "agent.predict.polymarket_event_distribution",
+        return_value=(poly_probs, 10000.0, "poly event 'Eurovision 2026' covered 4/4"),
+    ), patch("agent.predict.llm_forecast_ensemble_full") as llm_mock:
+        out = predict(event)
+    # LLM not called when Polymarket has a match
+    llm_mock.assert_not_called()
+    by_market = {p["market"]: p["probability"] for p in out["probabilities"]}
+    # Polymarket sum = 0.70; after normalization to sum=1: France = 0.30/0.70 = 0.4286
+    assert by_market["France"] == pytest.approx(0.30 / 0.70)
+    assert sum(by_market.values()) == pytest.approx(1.0)
+    assert "poly event" in out["rationale"]
 
 
 def test_predict_multi_outcome_passes_probabilities_through():

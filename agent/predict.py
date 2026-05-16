@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 from agent.calibrate import apply_calibration, get_calibration_table
 from agent.kalshi import get_market
 from agent.llm import llm_forecast, llm_forecast_ensemble, llm_forecast_ensemble_full
-from agent.polymarket import polymarket_quote
+from agent.polymarket import polymarket_event_distribution, polymarket_quote
 from agent.prediction_log import log_prediction
 from agent.priors import category_prior, llm_allowed_for
 
@@ -278,6 +278,21 @@ TAIL_LOW = 0.05
 TAIL_HIGH = 0.95
 TAIL_MIN_VOL_24H = 500.0  # USD — high enough that the price reflects real consensus,
                           # not a $5 thin-book accident.
+# Tiny shrinkage applied on the tail-anchor return path. Markets are usually
+# slightly overconfident at the extremes; a 3% pull toward 0.5 is free Brier
+# protection when the market is wrong, and costs almost nothing when it's
+# right (0.97 vs 0.95 contribution to per-event squared error is negligible).
+TAIL_ANCHOR_SHRINK = 0.03
+
+# Safe-band auto-anchor. When Kalshi is liquid AND its raw price sits in the
+# central band, the book is well-calibrated and the LLM/Polymarket blend
+# can only add variance. Skip the Polymarket cross-reference (and the
+# downstream sanity guardrail) — go straight to volume-weighted shrinkage.
+# Inside the safe band the cross-venue divergence rarely matters; outside,
+# we keep the blend so disagreement can pull us off a thin Kalshi book.
+SAFE_BAND_LOW = 0.20
+SAFE_BAND_HIGH = 0.80
+SAFE_BAND_MIN_VOL_24H = 10_000  # USD — "liquid enough to trust without Poly cross-ref"
 
 # Market-deviation sanity guardrail. When our final prediction differs
 # materially from a deep liquid Kalshi book, one of us is wrong — and at
@@ -576,11 +591,15 @@ def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
 def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
     """Forecast for events with 3+ outcomes.
 
-    The market-anchor / sportsbook / manifold tiers are all designed for 2-
-    outcome binary questions, so they're skipped entirely. Go straight to
-    the LLM ensemble with explicit framing, aggregate per-outcome
-    probabilities across vendors, and normalize the final distribution to
-    sum to 1 (server contract).
+    Order of preference:
+      1. Polymarket multi-outcome event with sufficient coverage. Real
+         market prices on the same question are a much stronger prior
+         than naked LLM speculation.
+      2. LLM ensemble with explicit "p_yes is P(outcomes[0])" framing
+         and per-outcome distribution output.
+      3. Uniform 1/N when both fail.
+
+    Final distribution always normalized to sum=1 (server contract).
     """
     event_d = event.model_dump()
     outcomes = event.outcomes or []
@@ -588,6 +607,29 @@ def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
     k = _estimate_winners_count(event)
     prior = _uniform_prior(event)
 
+    # Step 1: try Polymarket multi-outcome event.
+    try:
+        poly_out = polymarket_event_distribution(event_d)
+    except Exception as e:
+        logger.warning("polymarket event lookup raised: %s", e)
+        poly_out = None
+    if poly_out is not None:
+        probs, vol_24h, poly_rationale = poly_out
+        dist = _normalize_distribution(probs, outcomes)
+        p_yes_value = next(
+            (p.probability for p in dist if p.market == outcomes[0]),
+            prior,
+        )
+        p_yes_value = max(0.01, min(0.99, p_yes_value))
+        return PredictionResponse(
+            probabilities=dist,
+            p_yes=p_yes_value,
+            rationale=(
+                f"multi-outcome ({n_out} options, top-{k}); {poly_rationale}"
+            ),
+        )
+
+    # Step 2: LLM ensemble.
     out = llm_forecast_ensemble_full(event_d)
     if out is None:
         # Uniform fallback. For top-K questions, every outcome is equally
@@ -671,13 +713,28 @@ def _forecast(event: EventRequest) -> PredictionResponse:
         and vol_24h >= TAIL_MIN_VOL_24H
         and (raw_p < TAIL_LOW or raw_p > TAIL_HIGH)
     ):
-        p = max(0.01, min(0.99, raw_p))
+        # Free Brier protection: pull market a tiny bit toward 0.5.
+        shrunk = (1 - TAIL_ANCHOR_SHRINK) * raw_p + TAIL_ANCHOR_SHRINK * 0.5
+        p = max(0.01, min(0.99, shrunk))
         return _wrap_binary(
-            p, f"tail-anchor {p:.3f} (vol24h=${vol_24h:.0f}); {rationale}", event
+            p,
+            f"tail-anchor {raw_p:.3f}→{p:.3f} (α={TAIL_ANCHOR_SHRINK}, vol24h=${vol_24h:.0f}); {rationale}",
+            event,
         )
 
-    # Cross-reference Polymarket when category is on the allowlist.
-    raw_p, rationale = _blend_with_polymarket(event, market, raw_p, rationale)
+    # Safe-band auto-anchor: deep liquid Kalshi book in the central range.
+    # Skip Polymarket blend; book is well-calibrated here and the blend
+    # only adds variance.
+    in_safe_band = (
+        raw_p is not None
+        and vol_24h >= SAFE_BAND_MIN_VOL_24H
+        and SAFE_BAND_LOW <= raw_p <= SAFE_BAND_HIGH
+    )
+
+    # Cross-reference Polymarket when category is on the allowlist AND we're
+    # NOT in the safe band (where it only adds variance).
+    if not in_safe_band:
+        raw_p, rationale = _blend_with_polymarket(event, market, raw_p, rationale)
 
     if raw_p is None:
         return _llm_fallback(event, reason=rationale)

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from agent.polymarket import (
     MATCH_THRESHOLD,
     MIN_VOLUME_24H,
@@ -189,3 +191,119 @@ def test_polymarket_quote_handles_network_failure():
 
     with patch("agent.polymarket.requests.get", side_effect=_raise):
         assert polymarket_quote({"title": "anything", "category": "Politics"}) is None
+
+
+# ---- multi-outcome event lookup ----
+
+from agent.polymarket import (  # noqa: E402
+    _find_event_match,
+    _map_child_to_outcome,
+    polymarket_event_distribution,
+)
+
+
+def _event_payload(title: str, child_markets: list[dict]) -> dict:
+    return {
+        "title": title,
+        "ticker": "TEST-EVENT",
+        "closed": False,
+        "archived": False,
+        "markets": child_markets,
+    }
+
+
+def _child(question: str, yes_price: float, vol: float = 1000.0) -> dict:
+    return {
+        "question": question,
+        "outcomes": '["Yes", "No"]',
+        "outcomePrices": f'["{yes_price}", "{1.0 - yes_price}"]',
+        "bestBid": max(0.0, yes_price - 0.01),
+        "bestAsk": min(1.0, yes_price + 0.01),
+        "lastTradePrice": yes_price,
+        "volume24hr": vol,
+        "closed": False,
+        "archived": False,
+        "active": True,
+    }
+
+
+def test_map_child_outcome_matches_subset_tokens():
+    outcomes = ["Albania", "France", "Sweden", "Italy"]
+    assert _map_child_to_outcome("Will Albania win Eurovision 2026?", outcomes) == "Albania"
+    assert _map_child_to_outcome("Will France finish top 5?", outcomes) == "France"
+    # No outcome mentioned → None
+    assert _map_child_to_outcome("Will it rain in Geneva tomorrow?", outcomes) is None
+
+
+def test_event_match_requires_three_plus_children():
+    sparse = _event_payload("Eurovision 2026", [_child("Will Albania win?", 0.05)])
+    with patch("agent.polymarket._search_events", return_value=[sparse]):
+        assert _find_event_match("Eurovision 2026 winner") is None
+
+
+def test_event_distribution_covers_outcomes():
+    event_payload = _event_payload(
+        "Eurovision 2026 Winner",
+        [
+            _child("Will Albania win Eurovision 2026?", 0.05),
+            _child("Will France win Eurovision 2026?", 0.30),
+            _child("Will Sweden win Eurovision 2026?", 0.20),
+            _child("Will Italy win Eurovision 2026?", 0.15),
+        ],
+    )
+    with patch("agent.polymarket._search_events", return_value=[event_payload]):
+        out = polymarket_event_distribution(
+            {
+                "title": "Who will win Eurovision 2026?",
+                "outcomes": ["Albania", "France", "Sweden", "Italy"],
+            }
+        )
+    assert out is not None
+    probs, vol, rationale = out
+    by_market = {p["market"]: p["probability"] for p in probs}
+    assert by_market["France"] == pytest.approx(0.30)
+    assert by_market["Albania"] == pytest.approx(0.05)
+    assert "covered 4/4" in rationale
+
+
+def test_event_distribution_returns_none_when_coverage_too_sparse():
+    """Need MIN_OUTCOMES_COVERED of event outcomes mapped, else None."""
+    event_payload = _event_payload(
+        "Eurovision 2026 Winner",
+        [
+            _child("Will Albania win Eurovision 2026?", 0.05),
+            # Other children don't match our outcomes list
+            _child("Will Belarus win Eurovision 2026?", 0.02),
+            _child("Will Russia win Eurovision 2026?", 0.01),
+        ],
+    )
+    with patch("agent.polymarket._search_events", return_value=[event_payload]):
+        out = polymarket_event_distribution(
+            {
+                "title": "Who will win Eurovision 2026?",
+                "outcomes": ["Albania", "France", "Sweden", "Italy", "Germany"],
+            }
+        )
+    # 1 of 5 = 20% < MIN_OUTCOMES_COVERED → None.
+    assert out is None
+
+
+def test_event_distribution_returns_none_for_binary_events():
+    """Binary events skip the multi-outcome event lookup entirely."""
+    out = polymarket_event_distribution(
+        {"title": "Will A win?", "outcomes": ["A", "B"]}
+    )
+    assert out is None
+
+
+def test_event_distribution_handles_network_failure():
+    import requests
+
+    def _raise(*a, **kw):
+        raise requests.RequestException("boom")
+
+    with patch("agent.polymarket.requests.get", side_effect=_raise):
+        out = polymarket_event_distribution(
+            {"title": "anything", "outcomes": ["A", "B", "C", "D"]}
+        )
+    assert out is None

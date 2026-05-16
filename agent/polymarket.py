@@ -221,3 +221,156 @@ def polymarket_quote(event: dict) -> tuple[float, float, str] | None:
         f"poly '{question}' p={p:.3f} vol24h=${vol_24h:.0f} (match={score:.2f})"
     )
     return p, vol_24h, rationale
+
+
+# ---------------------------------------------------------------------------
+# Multi-outcome event lookup
+# ---------------------------------------------------------------------------
+#
+# For 3+ outcome Kalshi events, Polymarket often has the same question
+# structured as ONE "event" with N child binary markets (one per outcome).
+# E.g., Kalshi "Who wins Eurovision 2026?" with 35 outcomes corresponds to
+# a Polymarket event "Eurovision 2026 Winner" containing 35 markets like
+# "Will Albania win Eurovision 2026?" → Yes/No.
+#
+# To use Polymarket as a multi-outcome prior we pull the event, extract
+# each child market's YES probability, and map child-market titles to our
+# event's `outcomes` list by token overlap. The result is a distribution
+# we can use as a much stronger prior than naked LLM speculation.
+
+EVENT_SEARCH_LIMIT = 10
+MULTI_MATCH_THRESHOLD = 0.45     # looser than binary — event titles differ more
+MIN_OUTCOMES_COVERED = 0.60      # need at least 60% of event outcomes mapped to a child
+
+
+def _search_events(query: str, limit: int = EVENT_SEARCH_LIMIT) -> list[dict[str, Any]]:
+    """Fetch open Polymarket events. Empty list on failure."""
+    if not query:
+        return []
+    try:
+        r = requests.get(
+            f"{BASE}/events",
+            params={
+                "active": "true",
+                "closed": "false",
+                "archived": "false",
+                "limit": limit,
+                "order": "volume24hr",
+                "ascending": "false",
+                "search": query,
+            },
+            timeout=TIMEOUT,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except requests.RequestException as e:
+        logger.warning("Polymarket event search failed for %r: %s", query, e)
+        return []
+    except ValueError:
+        return []
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("data") or data.get("events") or []
+    return []
+
+
+def _find_event_match(title: str) -> tuple[dict[str, Any], float] | None:
+    """Best-matching Polymarket event for `title`, or None."""
+    query_tokens = _tokens(title)
+    if not query_tokens:
+        return None
+    candidates = _search_events(title)
+    best: tuple[dict[str, Any], float] | None = None
+    for ev in candidates:
+        if ev.get("closed") is True or ev.get("archived") is True:
+            continue
+        ev_title = ev.get("title") or ev.get("ticker") or ""
+        score = _overlap(query_tokens, _tokens(ev_title))
+        if score < MULTI_MATCH_THRESHOLD:
+            continue
+        markets = ev.get("markets")
+        if not isinstance(markets, list) or len(markets) < 3:
+            continue
+        if best is None or score > best[1]:
+            best = (ev, score)
+    return best
+
+
+def _map_child_to_outcome(child_question: str, outcomes: list[str]) -> str | None:
+    """Match a child market title to one of our event's outcomes by tokens."""
+    child_tokens = _tokens(child_question)
+    if not child_tokens:
+        return None
+    best_outcome: str | None = None
+    best_score = 0.0
+    for outcome in outcomes:
+        outcome_tokens = _tokens(outcome)
+        if not outcome_tokens:
+            continue
+        # All outcome tokens must appear in child question — strict match
+        # ensures e.g. "Albania" → "Will Albania win Eurovision?" not
+        # "Will Albanian-Greek border close?".
+        if outcome_tokens.issubset(child_tokens):
+            score = len(outcome_tokens) / len(child_tokens)
+            if score > best_score:
+                best_score = score
+                best_outcome = outcome
+    return best_outcome
+
+
+def polymarket_event_distribution(
+    event: dict,
+) -> tuple[list[dict[str, float]], float, str] | None:
+    """Pull a multi-outcome probability distribution from Polymarket.
+
+    Returns (probabilities_list, total_volume_24h, rationale) where the
+    list is [{market, probability}, ...] covering as many of our event's
+    outcomes as we could map. Caller is responsible for normalizing to
+    sum=1 (we leave that to _normalize_distribution upstream).
+
+    None when no usable event match or coverage is too sparse.
+    """
+    title = event.get("title") or ""
+    outcomes = event.get("outcomes") or []
+    if not title or len(outcomes) < 3:
+        return None
+
+    match = _find_event_match(title)
+    if match is None:
+        return None
+    ev, event_score = match
+    markets = ev.get("markets") or []
+
+    # Build {outcome → P(Yes)} from child markets.
+    by_outcome: dict[str, float] = {}
+    total_vol = 0.0
+    for child in markets:
+        if not isinstance(child, dict):
+            continue
+        if child.get("closed") is True or child.get("archived") is True:
+            continue
+        question = child.get("question") or ""
+        mapped = _map_child_to_outcome(question, outcomes)
+        if mapped is None or mapped in by_outcome:
+            continue
+        p = _market_p_yes(child)
+        if p is None:
+            continue
+        by_outcome[mapped] = max(0.0, min(1.0, p))
+        total_vol += _f(child, "volume24hr", "volume_24hr")
+
+    coverage = len(by_outcome) / len(outcomes)
+    if coverage < MIN_OUTCOMES_COVERED:
+        return None
+
+    probs: list[dict[str, float]] = [
+        {"market": o, "probability": by_outcome.get(o, 0.0)} for o in outcomes
+    ]
+    ev_title = (ev.get("title") or "?")[:80]
+    rationale = (
+        f"poly event '{ev_title}' "
+        f"covered {len(by_outcome)}/{len(outcomes)} outcomes "
+        f"(match={event_score:.2f}, vol24h=${total_vol:.0f})"
+    )
+    return probs, total_vol, rationale

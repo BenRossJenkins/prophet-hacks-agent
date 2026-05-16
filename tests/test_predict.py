@@ -450,6 +450,81 @@ def test_tail_shrink_preserves_directional_signal():
     assert low < 0.5
 
 
+# ---- Safe-band auto-anchor (Polymarket skip) -----------------------------------
+
+
+def test_safe_band_skips_polymarket():
+    """Liquid Kalshi in [0.20, 0.80] → no Polymarket cross-reference."""
+    e = _event()
+    e["category"] = "Politics"  # would normally trigger Polymarket
+    e["outcomes"] = ["TeamA", "TeamB"]
+    market = {
+        "yes_bid_dollars": "0.49",
+        "yes_ask_dollars": "0.51",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.49",
+        "no_ask_dollars": "0.51",
+        "last_price_dollars": "0.50",
+        "volume_24h_fp": "20000",  # above SAFE_BAND_MIN_VOL_24H
+    }
+    with patch("agent.predict.get_market", return_value=market), patch(
+        "agent.predict.polymarket_quote"
+    ) as poly_mock:
+        out = predict(e)
+    poly_mock.assert_not_called()
+    # Final p ≈ 0.50 shrunk slightly; no blend, no guardrail.
+    assert 0.49 < out["p_yes"] < 0.51
+
+
+def test_outside_safe_band_still_uses_polymarket():
+    """At p=0.85 we're outside safe band → blend still runs."""
+    e = _event()
+    e["category"] = "Politics"
+    e["outcomes"] = ["TeamA", "TeamB"]
+    market = {
+        "yes_bid_dollars": "0.84",
+        "yes_ask_dollars": "0.86",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.14",
+        "no_ask_dollars": "0.16",
+        "last_price_dollars": "0.85",
+        "volume_24h_fp": "20000",
+    }
+    with patch("agent.predict.get_market", return_value=market), patch(
+        "agent.predict.polymarket_quote",
+        return_value=(0.80, 5000.0, "poly p=0.80"),
+    ) as poly_mock:
+        predict(e)
+    poly_mock.assert_called_once()
+
+
+def test_safe_band_below_min_vol_still_blends():
+    """Low-volume Kalshi in safe band: still gets Polymarket cross-reference."""
+    e = _event()
+    e["category"] = "Politics"
+    e["outcomes"] = ["TeamA", "TeamB"]
+    from agent.predict import SAFE_BAND_MIN_VOL_24H
+
+    market = {
+        "yes_bid_dollars": "0.49",
+        "yes_ask_dollars": "0.51",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.49",
+        "no_ask_dollars": "0.51",
+        "last_price_dollars": "0.50",
+        "volume_24h_fp": str(SAFE_BAND_MIN_VOL_24H - 100),
+    }
+    with patch("agent.predict.get_market", return_value=market), patch(
+        "agent.predict.polymarket_quote",
+        return_value=(0.55, 2000.0, "poly p=0.55"),
+    ) as poly_mock:
+        predict(e)
+    poly_mock.assert_called_once()
+
+
 # ---- Market sanity guardrail -----------------------------------------------
 
 
@@ -467,20 +542,20 @@ def _deep_market(yes_bid: str, yes_ask: str, vol: float = 200_000) -> dict:
 
 
 def test_guardrail_anchors_when_polymarket_pulls_far_from_kalshi():
-    """Deep Kalshi at 0.50, Polymarket at 0.95 → blended drifts > 0.30 from Kalshi → anchor back."""
+    """Kalshi at 0.85 (outside safe band), Polymarket at 0.30 → blend pulls far → anchor back."""
     e = _event()
     e["category"] = "Politics"
-    kalshi = _deep_market("0.49", "0.51", vol=200_000)
+    # Kalshi at 0.85 (outside [0.20, 0.80] safe band) so Polymarket blend fires.
+    kalshi = _deep_market("0.84", "0.86", vol=200_000)
     with patch("agent.predict.get_market", return_value=kalshi), patch(
         "agent.predict.polymarket_quote",
-        return_value=(0.95, 500_000.0, "poly p=0.95 vol24h=$500000 (match=0.85)"),
+        return_value=(0.30, 500_000.0, "poly p=0.30 vol24h=$500000 (match=0.85)"),
     ):
         out = predict(e)
-    # Without guardrail, vol-weighted blend = (0.50*200k + 0.95*500k) / 700k ≈ 0.821 → shrunk slightly.
-    # Deviation from kalshi mid (0.50) is large; guardrail blends 0.6*0.50 + 0.4*final.
+    # Without guardrail: vol-weighted blend = (0.85*200k + 0.30*500k) / 700k ≈ 0.457 — far from Kalshi 0.85.
+    # Guardrail blends 0.6*0.85 + 0.4*final back toward market.
     assert "guardrail" in out["rationale"]
-    # Result should be closer to Kalshi than to Polymarket.
-    assert abs(out["p_yes"] - 0.50) < abs(out["p_yes"] - 0.95)
+    assert abs(out["p_yes"] - 0.85) < abs(out["p_yes"] - 0.30)
 
 
 def test_guardrail_no_op_for_low_volume_kalshi():
@@ -565,8 +640,8 @@ def test_tail_anchor_high_skips_llm_and_polymarket():
         out = predict(e)
     poly_mock.assert_not_called()
     llm_mock.assert_not_called()
-    # depth-mid = 0.97 (equal sizes), returned WITHOUT shrinkage.
-    assert out["p_yes"] == pytest.approx(0.97)
+    # depth-mid 0.97 with TAIL_ANCHOR_SHRINK=0.03 → 0.97*0.97 + 0.03*0.5 = 0.9559
+    assert out["p_yes"] == pytest.approx(0.97 * 0.97 + 0.03 * 0.5)
     assert "tail-anchor" in out["rationale"]
 
 
@@ -576,7 +651,8 @@ def test_tail_anchor_low_skips_llm():
     ) as llm_mock:
         out = predict(_event())
     llm_mock.assert_not_called()
-    assert out["p_yes"] == pytest.approx(0.03)
+    # 0.03 * 0.97 + 0.5 * 0.03 = 0.0441
+    assert out["p_yes"] == pytest.approx(0.03 * 0.97 + 0.5 * 0.03)
     assert "tail-anchor" in out["rationale"]
 
 

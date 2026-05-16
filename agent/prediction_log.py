@@ -7,11 +7,25 @@ actual outcome.
 
 Log format (JSONL, one record per line):
 {
-  "ts":        ISO timestamp of prediction,
-  "event":     event dict passed to predict(),
-  "p_yes":     float,
-  "rationale": str
+  "ts":         ISO timestamp of prediction,
+  "event":      event dict passed to predict(),
+  "p_yes":      float (probability of outcomes[0]),
+  "rationale":  str (verbose human-readable),
+  "metadata":   {
+    "path":            str — which pipeline branch produced this prediction
+                       ("tail-anchor"/"safe-band-anchor"/"poly-only"/
+                        "kalshi+poly-blend"/"kalshi-anchor"/"guardrail-anchored"/
+                        "prior"/"llm-grounded"/"llm-speculative"/"uniform"/
+                        "multi-outcome-poly"/"multi-outcome-llm"/"multi-outcome-uniform")
+    "category":        str — event category for stratified Brier analysis
+    "n_outcomes":      int — len(outcomes), useful for binary-vs-multi grouping
+  }
 }
+
+The `metadata.path` field enables rolling backtest analysis during the
+eval window: which paths win on Brier, which need parameter tuning, etc.
+Classification is done by string-match on the rationale to avoid threading
+structured signals all the way through the forecast pipeline.
 
 Defensive: log_prediction never raises. A logging failure must not break
 a live `/predict` response.
@@ -24,6 +38,7 @@ import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -34,16 +49,66 @@ def get_log_path() -> Path:
     return Path(os.environ.get("PREDICTION_LOG_PATH", DEFAULT_LOG_PATH))
 
 
-def log_prediction(event: dict, p_yes: float, rationale: str) -> None:
-    """Append a single prediction to the log file. Never raises."""
+def classify_path(rationale: str) -> str:
+    """Map a rationale string to a coarse pipeline-branch label.
+
+    Order matters: more specific markers checked first. Each prediction
+    came from exactly one branch, but rationales can compose (e.g.
+    'tail-anchor ... guardrail anchored' would be very unusual).
+    """
+    r = rationale or ""
+    if "multi-outcome" in r:
+        if "poly event" in r:
+            return "multi-outcome-poly"
+        if "LLM unavailable" in r:
+            return "multi-outcome-uniform"
+        return "multi-outcome-llm"
+    if "guardrail anchored" in r:
+        return "guardrail-anchored"
+    if "tail-anchor" in r:
+        return "tail-anchor"
+    if "polymarket-only" in r:
+        return "poly-only"
+    if "blend" in r and "kalshi" in r.lower():
+        return "kalshi+poly-blend"
+    if "LLM (grounded" in r:
+        return "llm-grounded"
+    if "LLM (speculative" in r:
+        return "llm-speculative"
+    if "LLM unavailable" in r or "uniform prior" in r:
+        return "uniform"
+    if "prior:" in r:
+        return "prior"
+    return "kalshi-anchor"
+
+
+def log_prediction(
+    event: dict, p_yes: float, rationale: str, metadata: dict[str, Any] | None = None
+) -> None:
+    """Append a single prediction to the log file. Never raises.
+
+    `metadata` is auto-populated with the classified path if absent.
+    Callers can pass extra fields (e.g. p_yes_pre_calibration) and they
+    will be merged in.
+    """
     try:
         path = get_log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
+        meta: dict[str, Any] = {
+            "path": classify_path(rationale),
+            "category": (event.get("category") or "") if isinstance(event, dict) else "",
+            "n_outcomes": (
+                len(event.get("outcomes") or []) if isinstance(event, dict) else 0
+            ),
+        }
+        if metadata:
+            meta.update(metadata)
         entry = {
             "ts": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             "event": event,
-            "p_yes": float(p_yes),
+            "p_yes": float(p_yes) if p_yes is not None else None,
             "rationale": rationale,
+            "metadata": meta,
         }
         with path.open("a") as f:
             f.write(json.dumps(entry) + "\n")

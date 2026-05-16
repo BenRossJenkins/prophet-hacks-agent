@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agent.prediction_log import get_log_path, log_prediction
+from agent.prediction_log import classify_path, get_log_path, log_prediction
 
 
 def test_get_log_path_uses_env(monkeypatch, tmp_path: Path):
@@ -44,3 +44,56 @@ def test_log_prediction_swallows_errors(monkeypatch):
     # Patch Path.mkdir to raise so the parent-dir creation fails
     with patch("pathlib.Path.mkdir", side_effect=OSError("denied")):
         log_prediction({"market_ticker": "X"}, 0.5, "r")
+
+
+# ---- classify_path ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "rationale,expected",
+    [
+        ("tail-anchor 0.97→0.956 (α=0.03)", "tail-anchor"),
+        ("multi-outcome (18 options, top-4); poly event 'X'", "multi-outcome-poly"),
+        ("multi-outcome (35 options, top-1); LLM unavailable; uniform", "multi-outcome-uniform"),
+        ("multi-outcome (15 options, top-1); raw=0.18; ensemble", "multi-outcome-llm"),
+        ("depth-mid 0.500; shrunk α=0.005 → 0.500; guardrail anchored 0.821→0.628", "guardrail-anchored"),
+        ("polymarket-only (poly p=0.65); kalshi: fetch failed", "poly-only"),
+        ("blend 0.45 vol-weighted (kalshi=$200000 poly=$500000)", "kalshi+poly-blend"),
+        ("kalshi fetch failed; LLM (grounded, α_base=0.05, raw=0.62→0.617)", "llm-grounded"),
+        ("kalshi fetch failed; LLM (speculative, α_base=0.15, raw=0.40)", "llm-speculative"),
+        ("kalshi fetch failed; LLM unavailable; uniform prior", "uniform"),
+        ("kalshi fetch failed; prior: yfinance spot $90000", "prior"),
+        ("depth-mid 0.500; shrunk α=0.005 → 0.500", "kalshi-anchor"),
+    ],
+)
+def test_classify_path_maps_rationales(rationale, expected):
+    assert classify_path(rationale) == expected
+
+
+def test_log_prediction_adds_metadata(tmp_path: Path, monkeypatch):
+    target = tmp_path / "preds.jsonl"
+    monkeypatch.setenv("PREDICTION_LOG_PATH", str(target))
+    log_prediction(
+        {"market_ticker": "X", "category": "Sports", "outcomes": ["A", "B"]},
+        0.62,
+        "tail-anchor 0.97→0.956 (α=0.03)",
+    )
+    r = json.loads(target.read_text().strip())
+    assert r["metadata"]["path"] == "tail-anchor"
+    assert r["metadata"]["category"] == "Sports"
+    assert r["metadata"]["n_outcomes"] == 2
+
+
+def test_log_prediction_merges_extra_metadata(tmp_path: Path, monkeypatch):
+    target = tmp_path / "preds.jsonl"
+    monkeypatch.setenv("PREDICTION_LOG_PATH", str(target))
+    log_prediction(
+        {"market_ticker": "X", "category": "Politics", "outcomes": ["Yes", "No"]},
+        0.5,
+        "kalshi fetch failed; LLM (grounded, raw=0.5)",
+        metadata={"p_yes_pre_calibration": 0.62, "deadline_hit": False},
+    )
+    r = json.loads(target.read_text().strip())
+    assert r["metadata"]["path"] == "llm-grounded"
+    assert r["metadata"]["p_yes_pre_calibration"] == pytest.approx(0.62)
+    assert r["metadata"]["deadline_hit"] is False
