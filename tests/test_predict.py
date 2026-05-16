@@ -453,10 +453,10 @@ def test_tail_shrink_preserves_directional_signal():
 # ---- Safe-band auto-anchor (Polymarket skip) -----------------------------------
 
 
-def test_safe_band_skips_polymarket():
-    """Liquid Kalshi in [0.20, 0.80] → no Polymarket cross-reference."""
+def test_safe_band_skips_blend_when_polymarket_agrees():
+    """Liquid Kalshi in [0.20, 0.80] + Polymarket agrees within tol → no blend."""
     e = _event()
-    e["category"] = "Politics"  # would normally trigger Polymarket
+    e["category"] = "Politics"  # Polymarket-eligible
     e["outcomes"] = ["TeamA", "TeamB"]
     market = {
         "yes_bid_dollars": "0.49",
@@ -468,13 +468,44 @@ def test_safe_band_skips_polymarket():
         "last_price_dollars": "0.50",
         "volume_24h_fp": "20000",  # above SAFE_BAND_MIN_VOL_24H
     }
+    # Polymarket at 0.51 → |0.50 - 0.51| = 0.01 < CROSS_VENUE_DISAGREE_TOL (0.03)
     with patch("agent.predict.get_market", return_value=market), patch(
-        "agent.predict.polymarket_quote"
+        "agent.predict.polymarket_quote",
+        return_value=(0.51, 5000.0, "poly p=0.51"),
     ) as poly_mock:
         out = predict(e)
-    poly_mock.assert_not_called()
-    # Final p ≈ 0.50 shrunk slightly; no blend, no guardrail.
+    # Poly IS called (we check agreement), but result is "skip blend".
+    poly_mock.assert_called_once()
+    assert "skip blend" in out["rationale"] or "poly agrees" in out["rationale"]
+    # Final p stays close to Kalshi mid 0.50.
     assert 0.49 < out["p_yes"] < 0.51
+
+
+def test_safe_band_blends_when_polymarket_disagrees():
+    """Liquid Kalshi in safe band BUT Polymarket disagrees > tol → blend fires."""
+    e = _event()
+    e["category"] = "Politics"
+    e["outcomes"] = ["TeamA", "TeamB"]
+    market = {
+        "yes_bid_dollars": "0.49",
+        "yes_ask_dollars": "0.51",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.49",
+        "no_ask_dollars": "0.51",
+        "last_price_dollars": "0.50",
+        "volume_24h_fp": "20000",
+    }
+    # Polymarket at 0.65 → |0.50 - 0.65| = 0.15 > CROSS_VENUE_DISAGREE_TOL
+    with patch("agent.predict.get_market", return_value=market), patch(
+        "agent.predict.polymarket_quote",
+        return_value=(0.65, 5000.0, "poly p=0.65"),
+    ) as poly_mock:
+        out = predict(e)
+    poly_mock.assert_called_once()
+    # Blend should fire — final probability between Kalshi and Polymarket.
+    assert "blend" in out["rationale"]
+    assert 0.50 < out["p_yes"] < 0.65
 
 
 def test_outside_safe_band_still_uses_polymarket():

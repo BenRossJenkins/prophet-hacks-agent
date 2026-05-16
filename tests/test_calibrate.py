@@ -135,38 +135,40 @@ def test_fit_calibration_by_path_splits_rows():
 def test_apply_calibration_data_uses_path_when_n_sufficient():
     from agent.calibrate import apply_calibration_data
 
+    # Use a small shift (≤ MAX_CALIBRATION_SHIFT = 0.05) so the cap doesn't fire.
     data = {
         "global": [
-            {"bucket_lo": 0.9, "bucket_hi": 1.0, "n": 100, "mean_p": 0.95, "mean_actual": 0.92}
+            {"bucket_lo": 0.9, "bucket_hi": 1.0, "n": 100, "mean_p": 0.95, "mean_actual": 0.94}
         ],
         "by_path": {
             "tail-anchor": [
-                {"bucket_lo": 0.9, "bucket_hi": 1.0, "n": 20, "mean_p": 0.95, "mean_actual": 0.88}
+                {"bucket_lo": 0.9, "bucket_hi": 1.0, "n": 20, "mean_p": 0.95, "mean_actual": 0.92}
             ]
         },
     }
-    # Path bucket has n=20 >= min_n: use it.
-    assert apply_calibration_data(0.95, data, path="tail-anchor") == pytest.approx(0.88)
-    # No path provided → global.
-    assert apply_calibration_data(0.95, data) == pytest.approx(0.92)
+    # Path bucket has n=20 >= min_n: use it. |0.92 - 0.95| = 0.03 < cap.
+    assert apply_calibration_data(0.95, data, path="tail-anchor") == pytest.approx(0.92)
+    # No path provided → global. |0.94 - 0.95| = 0.01 < cap.
+    assert apply_calibration_data(0.95, data) == pytest.approx(0.94)
 
 
 def test_apply_calibration_data_falls_back_to_global_at_low_n():
     from agent.calibrate import apply_calibration_data
 
+    # Use shifts within the ±0.05 cap so we test only the fallback logic.
     data = {
         "global": [
-            {"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 50, "mean_p": 0.55, "mean_actual": 0.70}
+            {"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 50, "mean_p": 0.55, "mean_actual": 0.58}
         ],
         "by_path": {
             "tail-anchor": [
                 # n=2, below MIN_BUCKET_N_FOR_PATH (5) — should be ignored.
-                {"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 2, "mean_p": 0.55, "mean_actual": 0.40}
+                {"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 2, "mean_p": 0.55, "mean_actual": 0.52}
             ]
         },
     }
     # Path bucket exists but n<min — falls back to global.
-    assert apply_calibration_data(0.55, data, path="tail-anchor") == pytest.approx(0.70)
+    assert apply_calibration_data(0.55, data, path="tail-anchor") == pytest.approx(0.58)
 
 
 def test_apply_calibration_data_no_data_passes_through():
@@ -174,6 +176,61 @@ def test_apply_calibration_data_no_data_passes_through():
 
     assert apply_calibration_data(0.42, None) == 0.42
     assert apply_calibration_data(0.42, {}) == 0.42
+
+
+def test_apply_calibration_data_caps_shift_to_max_delta():
+    """A bucket that would shift the prediction by >0.05 is bounded to that delta.
+
+    Protects against a noisy 5-event bucket pulling a confident prediction
+    wildly off. With raw=0.90 and bucket mean_actual=0.50, the unbounded
+    correction would land at 0.50 (Δ=0.40). The bound keeps it at 0.85.
+    """
+    from agent.calibrate import MAX_CALIBRATION_SHIFT, apply_calibration_data
+
+    data = {
+        "global": [
+            {"bucket_lo": 0.9, "bucket_hi": 1.0, "n": 50, "mean_p": 0.95, "mean_actual": 0.50}
+        ],
+        "by_path": {},
+    }
+    out = apply_calibration_data(0.90, data)
+    # Without cap → 0.50. With cap → 0.90 - 0.05 = 0.85.
+    assert MAX_CALIBRATION_SHIFT == pytest.approx(0.05)
+    assert out == pytest.approx(0.85)
+
+
+def test_apply_calibration_data_small_shift_passes_unchanged():
+    """When the calibration correction is within the bound, no clipping."""
+    from agent.calibrate import apply_calibration_data
+
+    data = {
+        "global": [
+            {"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 50, "mean_p": 0.55, "mean_actual": 0.58}
+        ],
+        "by_path": {},
+    }
+    out = apply_calibration_data(0.55, data)
+    # |0.58 - 0.55| = 0.03 < 0.05 cap → no clipping.
+    assert out == pytest.approx(0.58)
+
+
+def test_apply_calibration_data_cap_applies_to_path_lookups_too():
+    """Cap applies regardless of whether the bucket came from by_path or global."""
+    from agent.calibrate import apply_calibration_data
+
+    data = {
+        "global": [
+            {"bucket_lo": 0.0, "bucket_hi": 0.2, "n": 100, "mean_p": 0.10, "mean_actual": 0.10}
+        ],
+        "by_path": {
+            "tail-anchor": [
+                {"bucket_lo": 0.0, "bucket_hi": 0.2, "n": 10, "mean_p": 0.10, "mean_actual": 0.90}
+            ]
+        },
+    }
+    # path bucket says 0.90, raw=0.10, unbounded Δ=0.80 — clamp to 0.10+0.05.
+    out = apply_calibration_data(0.10, data, path="tail-anchor")
+    assert out == pytest.approx(0.15)
 
 
 def test_save_calibration_accepts_v2_payload(tmp_path: Path):
@@ -248,9 +305,13 @@ def test_get_calibration_table_falls_back_to_disk_when_gcs_fails(tmp_path: Path,
 
 
 def test_predict_applies_calibration_when_table_present(tmp_path: Path, monkeypatch):
-    """End-to-end: predict() applies a calibration table that's present on disk."""
+    """End-to-end: predict() applies a calibration table that's present on disk.
+
+    Calibration shift is capped to ±MAX_CALIBRATION_SHIFT (0.05). With raw
+    p=0.5425 and a bucket mean_actual=0.7 (Δ=0.16), the cap clamps the
+    adjusted value to 0.5425 + 0.05 = 0.5925.
+    """
     out = tmp_path / "cal.json"
-    # 0.5 → 0.7 calibration on bucket [0.5, 0.6)
     save_calibration(
         [{"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 100, "mean_p": 0.55, "mean_actual": 0.7}],
         out,
@@ -273,7 +334,7 @@ def test_predict_applies_calibration_when_table_present(tmp_path: Path, monkeypa
                 "close_time": "2026-12-31T23:59:59Z",
             }
         )
-    # Speculative LLM shrink: 0.55 → 0.55 * 0.85 + 0.5 * 0.15 = 0.5425. Falls in [0.5, 0.6) bucket.
-    # Calibrated → 0.7.
-    assert out["p_yes"] == pytest.approx(0.7)
+    # Speculative LLM tail-aware shrink lands at 0.5425. Calibration would push
+    # to 0.7 (Δ=0.16) but cap clamps to 0.5425 + 0.05 = 0.5925.
+    assert out["p_yes"] == pytest.approx(0.5925)
     assert "calibrated" in out["rationale"]

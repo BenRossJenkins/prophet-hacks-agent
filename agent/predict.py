@@ -289,15 +289,17 @@ TAIL_MIN_VOL_24H = 500.0  # USD — high enough that the price reflects real con
 # right (0.97 vs 0.95 contribution to per-event squared error is negligible).
 TAIL_ANCHOR_SHRINK = 0.03
 
-# Safe-band auto-anchor. When Kalshi is liquid AND its raw price sits in the
-# central band, the book is well-calibrated and the LLM/Polymarket blend
-# can only add variance. Skip the Polymarket cross-reference (and the
-# downstream sanity guardrail) — go straight to volume-weighted shrinkage.
-# Inside the safe band the cross-venue divergence rarely matters; outside,
-# we keep the blend so disagreement can pull us off a thin Kalshi book.
+# Cross-venue agreement gate. When Kalshi and Polymarket agree closely
+# we skip the blend (the venue cross-reference adds no signal); when they
+# disagree by more than CROSS_VENUE_DISAGREE_TOL we blend (disagreement
+# carries information). This refines the older "safe-band skip" logic
+# (which skipped Poly blindly in [0.20, 0.80] regardless of agreement)
+# — disagreement in the mid-band is exactly where the cross-venue signal
+# is most informative.
 SAFE_BAND_LOW = 0.20
 SAFE_BAND_HIGH = 0.80
-SAFE_BAND_MIN_VOL_24H = 10_000  # USD — "liquid enough to trust without Poly cross-ref"
+SAFE_BAND_MIN_VOL_24H = 10_000  # USD — only consider skip when Kalshi is liquid
+CROSS_VENUE_DISAGREE_TOL = 0.03   # |kalshi - poly|; below this → skip the blend
 
 # Market-deviation sanity guardrail. When our final prediction differs
 # materially from a deep liquid Kalshi book, one of us is wrong — and at
@@ -432,6 +434,8 @@ def _blend_with_polymarket(
     kalshi_market: dict | None,
     kalshi_p: float | None,
     kalshi_rationale: str,
+    *,
+    skip_if_agree_within: float | None = None,
 ) -> tuple[float | None, str]:
     """If a Polymarket sibling exists, fold it into the price.
 
@@ -439,6 +443,11 @@ def _blend_with_polymarket(
       - Both books have signal: volume-weighted average of the two prices.
       - Only Polymarket has signal (Kalshi illiquid/missing): use Poly price.
       - Neither: pass kalshi_p (which may itself be None) through unchanged.
+
+    When `skip_if_agree_within` is set, AND both books have a price, AND the
+    two prices agree to within that tolerance, return the Kalshi price
+    unchanged. This is the "safe-band agreement gate" — when the venues
+    agree there's no signal to extract, skip the blend.
 
     Returns (p_or_none, rationale). When category isn't on the Polymarket
     allowlist or no usable Poly match exists, this is a pass-through.
@@ -459,6 +468,13 @@ def _blend_with_polymarket(
 
     if kalshi_p is None:
         return poly_p, f"polymarket-only ({poly_rationale}); kalshi: {kalshi_rationale}"
+
+    # Cross-venue agreement check: when both venues quote the same answer,
+    # there's no information in their agreement — skip the blend.
+    if skip_if_agree_within is not None and abs(kalshi_p - poly_p) <= skip_if_agree_within:
+        return kalshi_p, (
+            f"{kalshi_rationale}; poly agrees ({poly_p:.3f}, |Δ|≤{skip_if_agree_within:.2f}) → skip blend"
+        )
 
     kalshi_weight = _kalshi_volume_weight(kalshi_market)
     total_weight = kalshi_weight + poly_weight
@@ -727,18 +743,22 @@ def _forecast(event: EventRequest) -> PredictionResponse:
             event,
         )
 
-    # Safe-band auto-anchor: deep liquid Kalshi book in the central range.
-    # Skip Polymarket blend; book is well-calibrated here and the blend
-    # only adds variance.
+    # Cross-venue agreement gate: in the central band with a liquid book
+    # we only blend Polymarket when it actually disagrees with Kalshi
+    # (≥ CROSS_VENUE_DISAGREE_TOL). When the venues agree, the blend adds
+    # noise without signal. Outside the safe band we always blend (a thin
+    # Kalshi tail-price is exactly where Poly disagreement can help).
     in_safe_band = (
         raw_p is not None
         and vol_24h >= SAFE_BAND_MIN_VOL_24H
         and SAFE_BAND_LOW <= raw_p <= SAFE_BAND_HIGH
     )
-
-    # Cross-reference Polymarket when category is on the allowlist AND we're
-    # NOT in the safe band (where it only adds variance).
-    if not in_safe_band:
+    if in_safe_band:
+        raw_p, rationale = _blend_with_polymarket(
+            event, market, raw_p, rationale,
+            skip_if_agree_within=CROSS_VENUE_DISAGREE_TOL,
+        )
+    else:
         raw_p, rationale = _blend_with_polymarket(event, market, raw_p, rationale)
 
     if raw_p is None:

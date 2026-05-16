@@ -128,6 +128,40 @@ The container image is also available — `docker build -t agent .` then
 `docker run -p 8000:8000 -e ANTHROPIC_API_KEY=... agent` reproduces the
 Cloud Run deployment locally.
 
+## Reliability strategy
+
+Completion rate is multiplicative on the final score, so a hung or crashed
+request hurts as much as a wrong prediction. The agent is engineered so
+no single failure can break a /predict response:
+
+- **Ensemble hard deadline.** Each call to `llm_forecast_ensemble` is
+  capped at 8 minutes (well below the 10-min per-event budget). Vendors
+  still running at the deadline are abandoned and the median of whatever
+  responses arrived is returned. A single hung LLM vendor cannot
+  consume the whole budget.
+- **Multi-tier market fallback chain.** When the LLM stack is
+  unreachable, the agent falls through tail-anchor → Polymarket blend →
+  category prior (NWS / yfinance / ESPN / Manifold) → uniform 0.5. Every
+  external call is wrapped to return `None` on failure rather than
+  raise, so any tier can fail without blocking the next.
+- **Probabilities-only response contract is enforced at exactly one
+  place.** Every code path produces its final distribution via
+  `_wrap_binary` (binary events) or `_normalize_distribution`
+  (multi-outcome), so the wire response is always well-formed JSON with
+  probabilities summing to 1 and markets matching the event's outcomes.
+- **Bounded calibration shift.** Any single calibration adjustment is
+  capped at ±0.05 from the raw prediction so a noisy small-N bucket
+  cannot yank a confident forecast off track.
+- **GCS-mirrored prediction log.** Every prediction is also written as a
+  per-event JSON object to GCS so the daily calibration refit job has a
+  durable read source — predictions survive Cloud Run container
+  restarts and post-hoc audit is possible.
+
+The calibration table is refit nightly from resolved questions over the
+eval window; this is a parameter update from observed data, not a
+mid-eval code change. Architecture, prompts, and pipeline structure are
+frozen at submission.
+
 ## Agent contract
 
 The `/predict` endpoint matches the Prophet Arena spec

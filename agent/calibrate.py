@@ -64,6 +64,13 @@ DEFAULT_PATH = "data/calibration.json"
 # Per-path tables fall back to global aggressively at low N.
 MIN_BUCKET_N_FOR_PATH = 5
 
+# Maximum amount a single calibration correction can shift the raw
+# prediction. Protects against a small bucket (e.g. 5-7 events) with an
+# extreme mean_actual from pulling a confident prediction wildly off.
+# The shift is bounded as |adjusted - raw| <= MAX_CALIBRATION_SHIFT.
+# Set to None to disable.
+MAX_CALIBRATION_SHIFT: float | None = 0.05
+
 
 def fit_calibration(
     rows: list[dict],
@@ -184,6 +191,23 @@ def apply_calibration(p_yes: float, table: list[dict[str, Any]]) -> float:
     return max(0.01, min(0.99, float(bucket["mean_actual"])))
 
 
+def _bound_shift(raw: float, adjusted: float) -> float:
+    """Clip the magnitude of (adjusted - raw) to MAX_CALIBRATION_SHIFT.
+
+    Prevents a noisy small-N bucket from yanking a prediction far from
+    the model's actual signal. Returns the bounded value, clamped to
+    the submission-contract range.
+    """
+    if MAX_CALIBRATION_SHIFT is None:
+        return max(0.01, min(0.99, adjusted))
+    delta = adjusted - raw
+    if delta > MAX_CALIBRATION_SHIFT:
+        adjusted = raw + MAX_CALIBRATION_SHIFT
+    elif delta < -MAX_CALIBRATION_SHIFT:
+        adjusted = raw - MAX_CALIBRATION_SHIFT
+    return max(0.01, min(0.99, adjusted))
+
+
 def apply_calibration_data(
     p_yes: float,
     data: dict[str, Any] | None,
@@ -197,6 +221,8 @@ def apply_calibration_data(
       1. by_path[path] bucket containing p_yes, if its n >= min_n
       2. global bucket containing p_yes
       3. unchanged p_yes
+
+    The final adjustment is bounded so |adjusted - raw| ≤ MAX_CALIBRATION_SHIFT.
     """
     if not data:
         return p_yes
@@ -204,8 +230,9 @@ def apply_calibration_data(
         path_table = (data.get("by_path") or {}).get(path) or []
         bucket = _bucket_for(p_yes, path_table)
         if bucket is not None and int(bucket.get("n", 0)) >= min_n:
-            return max(0.01, min(0.99, float(bucket["mean_actual"])))
-    return apply_calibration(p_yes, data.get("global") or [])
+            return _bound_shift(p_yes, float(bucket["mean_actual"]))
+    adjusted = apply_calibration(p_yes, data.get("global") or [])
+    return _bound_shift(p_yes, adjusted)
 
 
 def save_calibration(
