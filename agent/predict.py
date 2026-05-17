@@ -664,11 +664,20 @@ def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
         )
 
     # Ensemble over multiple Claude variants; gracefully degrades to a single
-    # call if some members fail.
+    # call if some members fail. If the full ensemble returns None (all
+    # vendors failed simultaneously), retry once without web search —
+    # search tools rate-limit independently of base chat completions, and
+    # the eval server doesn't retry timed-out requests on our behalf.
     out = llm_forecast_ensemble(event_d)
+    retry_note = ""
+    if out is None:
+        logger.warning("ensemble returned None; retrying without web search")
+        out = llm_forecast_ensemble(event_d, with_web_search=False)
+        retry_note = " (retry, no-search)"
     if out is None:
         return _wrap_binary(0.5, f"{reason}; LLM unavailable; uniform prior", event)
     p_raw, llm_rationale = out
+    llm_rationale = llm_rationale + retry_note
     alpha_base = _llm_shrink_alpha(llm_rationale)
     p = _llm_shrink_with_tail(p_raw, alpha_base=alpha_base)
     tier = (
@@ -796,8 +805,16 @@ def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
             ),
         )
 
-    # Step 4: LLM ensemble.
+    # Step 4: LLM ensemble. Same retry-without-search dance as the binary
+    # path — if all vendors fail simultaneously (rare), search tools may
+    # be the saturated dimension; base chat completions are often still
+    # available.
     out = llm_forecast_ensemble_full(event_d)
+    if out is None:
+        logger.warning(
+            "multi-outcome ensemble returned None; retrying without web search"
+        )
+        out = llm_forecast_ensemble_full(event_d, with_web_search=False)
     if out is None:
         # Uniform fallback. For top-K questions, every outcome is equally
         # likely, so the distribution is just 1/N across outcomes (which

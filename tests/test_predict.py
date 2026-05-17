@@ -254,6 +254,32 @@ def test_predict_falls_back_to_uniform_when_both_market_and_llm_fail():
     assert "LLM unavailable" in out["rationale"]
 
 
+def test_predict_retries_ensemble_without_search_on_total_failure():
+    """When the first ensemble call returns None (all vendors failed),
+    retry once with with_web_search=False before falling to 0.5."""
+    # First call (with search): None. Second call (no search): returns a value.
+    call_args: list[dict] = []
+
+    def fake_ensemble(event_d, **kwargs):
+        call_args.append(kwargs)
+        if kwargs.get("with_web_search", True) is True:
+            return None
+        return (0.65, "fallback no-search response")
+
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.llm_forecast_ensemble", side_effect=fake_ensemble
+    ), patch("agent.predict.category_prior", return_value=None):
+        out = predict(_event())
+    # Verify the retry path fired
+    assert len(call_args) == 2
+    assert call_args[0].get("with_web_search", True) is True
+    assert call_args[1].get("with_web_search") is False
+    # Verify the retry's response landed in the final prediction
+    assert "retry, no-search" in out["rationale"]
+    # Verify the actual probability came from the retry call (raw 0.65 → shrunk)
+    assert out["p_yes"] != 0.5
+
+
 def test_predict_uses_llm_when_no_market_data():
     # No "grounded" marker in rationale → speculative shrink (α=0.15).
     with patch("agent.predict.get_market", return_value=None), patch(
