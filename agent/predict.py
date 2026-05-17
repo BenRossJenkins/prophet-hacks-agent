@@ -215,20 +215,30 @@ _LLM_DECISIVE_MARKERS = (
 
 
 def _default_outcomes(event: EventRequest) -> list[str]:
-    """Fall back to ['Yes', 'No'] when an event has no outcomes list.
+    """Use the event's `outcomes` when present; else fall back to ['Yes', 'No'].
 
-    Per the developer docs, every Event should arrive with an `outcomes`
-    field. This is a defensive fallback for malformed inputs / legacy
-    callers; do not rely on it.
+    1-outcome events (e.g. "Will X happen by date D?" with outcomes=['By D']):
+    preserve the single outcome rather than appending a synthetic 'No' that
+    would silently break the response contract (server requires every
+    response market to match an event outcome exactly).
     """
-    if event.outcomes and len(event.outcomes) >= 2:
+    if event.outcomes and len(event.outcomes) >= 1:
         return list(event.outcomes)
     return ["Yes", "No"]
 
 
 def _binary_distribution(p: float, outcomes: list[str]) -> list[MarketProbability]:
-    """Convert P(outcomes[0]) → 2-outcome distribution summing to 1."""
+    """Convert P(outcomes[0]) → response distribution.
+
+    For 2-outcome events: standard {outcomes[0]: p, outcomes[1]: 1-p}.
+    For 1-outcome events: return just that single outcome with p; the
+    server's score is (p - actual)² for that one label. Don't fabricate
+    a complement outcome — its label wouldn't match anything in the
+    event's outcomes list.
+    """
     p = max(0.0, min(1.0, p))
+    if len(outcomes) == 1:
+        return [MarketProbability(market=outcomes[0], probability=p)]
     return [
         MarketProbability(market=outcomes[0], probability=p),
         MarketProbability(market=outcomes[1], probability=1.0 - p),

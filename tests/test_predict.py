@@ -1369,6 +1369,27 @@ def test_path_stamp_multi_outcome_uniform_when_llm_fails(tmp_path):
     assert entry["metadata"]["path"] == "multi-outcome-uniform"
 
 
+def test_predict_one_outcome_event_returns_single_market(tmp_path):
+    """Events with len(outcomes)==1 (e.g. 'Will GTA6 ship by May 27?' →
+    outcomes=['By May 26, 2026']) must return that single label, not
+    fabricate a 'Yes'/'No' pair that won't match the event's outcomes."""
+    event = _event()
+    event["outcomes"] = ["By May 26, 2026"]
+    event["category"] = "Entertainment"
+    with patch("agent.predict.get_market", return_value=None), \
+         patch("agent.predict.polymarket_quote", return_value=None), \
+         patch("agent.predict.category_prior", return_value=None), \
+         patch(
+            "agent.predict.llm_forecast_ensemble",
+            return_value=(0.05, "low base rate"),
+         ):
+        out = predict(event)
+    assert len(out["probabilities"]) == 1
+    assert out["probabilities"][0]["market"] == "By May 26, 2026"
+    # The LLM gave 0.05; speculative shrink + clamp lands above 0.01.
+    assert 0.01 <= out["probabilities"][0]["probability"] <= 0.99
+
+
 def test_agent_version_logged_with_each_prediction(tmp_path):
     """Every log entry includes the agent version for post-eval attribution."""
     from agent.predict import AGENT_VERSION
