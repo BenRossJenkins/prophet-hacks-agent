@@ -229,6 +229,41 @@ def test_implied_prob_falls_back_to_last_on_arb_violation():
     assert "no-arb violation" in rationale
 
 
+def test_implied_prob_trusts_tight_spread_at_zero_volume():
+    """Regression: a settled-direction market with bid/ask pinned at 0.99/1.00
+    and zero 24h volume still carries the market's signal. We trust the
+    depth-mid (~0.995) rather than rejecting as illiquid."""
+    m = {
+        "yes_bid_dollars": "0.99",
+        "yes_ask_dollars": "1.00",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "last_price_dollars": "0.0",
+        "volume_24h_fp": "0",
+    }
+    p, rationale = _market_implied_prob(m, arb_violated=False)
+    assert p is not None
+    assert p == pytest.approx(0.995, abs=0.005)
+    assert "tight-spread" in rationale
+
+
+def test_implied_prob_still_requires_volume_for_wide_spread():
+    """Regression guard: wide spread (e.g. 0.10/0.40) at zero volume is
+    still rejected because the midprice is uninformative."""
+    m = {
+        "yes_bid_dollars": "0.10",
+        "yes_ask_dollars": "0.40",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "last_price_dollars": "0",
+        "volume_24h_fp": "0",
+    }
+    p, rationale = _market_implied_prob(m, arb_violated=False)
+    # Spread 0.30 > TIGHT_SPREAD_FOR_LOW_VOL → still requires volume
+    assert p is None
+    assert "no price signal" in rationale
+
+
 def test_implied_prob_none_when_no_signal():
     m = {
         "yes_bid_dollars": "0",

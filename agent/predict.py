@@ -80,6 +80,13 @@ MIN_VOL_24H = 10.0    # USD — below this the book is noise.
                       # the candlestick fixture (2026-05-14): markets with
                       # $10-50 24h vol still carry useful price signal.
 MAX_SPREAD = 0.50     # dollars — wider and the midprice is uninformative.
+TIGHT_SPREAD_FOR_LOW_VOL = 0.03  # spread below this trusts the book at any volume.
+                                 # Captures settled-direction markets where bid/ask
+                                 # is pinned (e.g. 0.99/1.00 on a resolved-but-not-
+                                 # yet-settled question) but 24h volume is zero
+                                 # because nobody's bothered to trade. 3-cent
+                                 # spread is "the market clearly believes this"
+                                 # territory; wider needs volume to confirm.
                       # Sweep on the diversified 267-entry fixture preferred
                       # 0.50 over 0.20 (~0.001 Brier). Wider tolerance lets
                       # more mid-tier markets use depth-mid; volume-weighted
@@ -465,17 +472,25 @@ def _market_implied_prob(
     last = _f(market, "last_price_dollars")
     vol = _f(market, "volume_24h_fp")
 
+    # Tight spread (e.g. 0.99/1.00 on a settled-direction market) carries
+    # the market's signal even when volume is zero. Trust those without
+    # requiring vol >= MIN_VOL_24H. Wider spreads still require volume to
+    # prevent us from anchoring to a single stale order on a noisy book.
+    spread = yes_ask - yes_bid if (yes_bid > 0 and yes_ask > 0) else 1.0
+    tight_spread = spread <= TIGHT_SPREAD_FOR_LOW_VOL
     book_usable = (
         not arb_violated
         and yes_bid > 0
         and yes_ask > 0
-        and (yes_ask - yes_bid) <= MAX_SPREAD
-        and vol >= MIN_VOL_24H
+        and spread <= MAX_SPREAD
+        and (tight_spread or vol >= MIN_VOL_24H)
     )
     if book_usable:
         p = _depth_weighted_mid(market) or (yes_bid + yes_ask) / 2
+        note = "tight-spread" if (tight_spread and vol < MIN_VOL_24H) else "depth-mid"
         return p, (
-            f"depth-mid {p:.3f} (bid={yes_bid:.3f}/ask={yes_ask:.3f}, vol24h=${vol:.0f})"
+            f"{note} {p:.3f} (bid={yes_bid:.3f}/ask={yes_ask:.3f}, "
+            f"spread={spread:.3f}, vol24h=${vol:.0f})"
         )
 
     if last > 0:
