@@ -1612,6 +1612,41 @@ def test_predict_topk_llm_safety_clamp_falls_back_to_uniform(tmp_path):
     assert "safety" in out["rationale"]
 
 
+def test_event_request_accepts_string_resolved_outcome():
+    """v3.18: resolved_outcome typing loosened from dict|None to Any|None.
+
+    The Prophet Arena spec shows null for open events but doesn't pin the
+    shape when present. The companion actuals.json maps
+    market_ticker → label_string, so resolved_outcome could plausibly arrive
+    as a string for resolved events. Previously typed as dict|None which
+    would have 422-ed any string value."""
+    from agent.predict import EventRequest
+
+    # Open event: null — should accept (unchanged).
+    e = EventRequest(
+        event_ticker="x", market_ticker="x", title="t", category="c",
+        close_time="2026-12-31T23:59:59Z", outcomes=["A", "B"],
+        resolved_outcome=None,
+    )
+    assert e.resolved_outcome is None
+
+    # Resolved as a string label — must NOT 422.
+    e = EventRequest(
+        event_ticker="x", market_ticker="x", title="t", category="c",
+        close_time="2026-12-31T23:59:59Z", outcomes=["A", "B"],
+        resolved_outcome="A",
+    )
+    assert e.resolved_outcome == "A"
+
+    # Resolved as a dict (the prior shape) — still accepted.
+    e = EventRequest(
+        event_ticker="x", market_ticker="x", title="t", category="c",
+        close_time="2026-12-31T23:59:59Z", outcomes=["A", "B"],
+        resolved_outcome={"market": "A"},
+    )
+    assert e.resolved_outcome == {"market": "A"}
+
+
 def test_predict_one_outcome_event_returns_single_market(tmp_path):
     """Events with len(outcomes)==1 (e.g. 'Will GTA6 ship by May 27?' →
     outcomes=['By May 26, 2026']) must return that single label, not

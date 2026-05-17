@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
@@ -47,7 +48,14 @@ class EventRequest(BaseModel):
     rules: str | None = None
     close_time: str
     outcomes: list[str] | None = None
-    resolved_outcome: dict | None = None
+    # The Prophet Arena spec shows `resolved_outcome: null` for open events
+    # but doesn't pin the shape when present. The companion `actuals.json`
+    # format maps market_ticker → outcome label (a string), suggesting
+    # resolved_outcome may arrive as a string for resolved events. The
+    # `--include-resolved` flag is opt-in, so in practice the eval harness
+    # sends null here, but we accept anything to avoid 422-ing a future
+    # spec change. The agent never reads this field — only logs/echoes it.
+    resolved_outcome: Any | None = None
 
 
 class MarketProbability(BaseModel):
@@ -79,16 +87,15 @@ class PredictionResponse(BaseModel):
     path: str | None = Field(default=None, exclude=True)
 
 
-# v3.17 — defensive exception handling on the LLM ensemble's sequential
-# paths. Previously the search anchor and the single-model short-circuit
-# both let exceptions propagate out, meaning a single Anthropic SDK
-# exception (network, parse, rate-limit-not-caught-internally) would kill
-# the whole ensemble — including preventing the other two vendors from
-# running. Now any exception from the anchor or single-model call is
-# caught and treated identically to a None return, so /predict survives
-# any single-vendor failure. Builds on v3.16 (Kalshi settled-market
+# v3.18 — loosen the EventRequest.resolved_outcome type to Any|None.
+# The spec example shows null for open events but doesn't pin the shape
+# when present; the companion actuals.json maps ticker→label_string, so
+# resolved_outcome could plausibly arrive as a string. Previously typed
+# as `dict | None`, which would have 422-ed any non-null/non-dict value.
+# The agent never reads this field — purely a defensive shape fix.
+# Builds on v3.17 (defensive LLM ensemble), v3.16 (Kalshi settled-market
 # coverage), v3.15 (sum-to-K), v3.14 (path-stamping).
-AGENT_VERSION = "v3.17"
+AGENT_VERSION = "v3.18"
 
 
 # Liquidity gates
