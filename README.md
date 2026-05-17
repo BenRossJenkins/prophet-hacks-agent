@@ -126,29 +126,42 @@ curl -X POST http://localhost:8000/predict \
 
 ## For evaluators / organizers
 
-To run the agent in a standardized environment:
+One-shot script (recommended): runs a clean end-to-end evaluation against
+a sample event slate.
 
 ```bash
-# 1. Clone + install
 git clone https://github.com/BenRossJenkins/prophet-hacks-agent.git
 cd prophet-hacks-agent
+
+export ANTHROPIC_API_KEY=sk-ant-...
+export OPENAI_API_KEY=sk-proj-...
+export GEMINI_API_KEY=AIza...
+
+bash scripts/evaluate_agent.sh
+```
+
+`scripts/evaluate_agent.sh` handles Python version checks, virtualenv
+setup, dependency installation, dataset retrieval, prediction, and a
+human-readable summary of outputs. Approximate cost is `$0.25` for the
+default 3-event smoke test; pass `EVAL_EVENT_COUNT=` (empty) to run the
+full sample slate.
+
+Manual setup, if you prefer step-by-step:
+
+```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 
-# 2. Provide LLM keys via environment (the agent reads from os.environ).
-#    The full ensemble requires all three; missing keys gracefully degrade.
-export ANTHROPIC_API_KEY=...
-export OPENAI_API_KEY=...
-export GEMINI_API_KEY=...
+export ANTHROPIC_API_KEY=... OPENAI_API_KEY=... GEMINI_API_KEY=...
 
-# 3. Start the server
+# Option A: run the agent as a local module via the official prophet CLI
+prophet forecast retrieve --dataset sample-sports -o events.json
+prophet forecast predict --events events.json --local agent.predict -o predictions.json
+
+# Option B: run as an HTTP server (matches the deployed Cloud Run setup)
 uvicorn agent.predict:app --host 0.0.0.0 --port 8000
-
-# 4. POST one event at a time
-curl -X POST http://localhost:8000/predict \
-    -H "Content-Type: application/json" \
-    -d '{"event_ticker":"x","market_ticker":"x","title":"Will A beat B?","category":"Sports","close_time":"2026-12-31T23:59:59Z","outcomes":["A","B"]}'
+prophet forecast predict --events events.json --agent-url http://localhost:8000/predict
 ```
 
 The container image is also available — `docker build -t agent .` then
