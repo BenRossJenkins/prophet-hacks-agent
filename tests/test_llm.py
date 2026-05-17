@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from agent.llm import _extract_text, parse_response
+from agent.llm import _build_user_prompt, _extract_text, parse_response
 
 
 class _TextBlock:
@@ -73,3 +73,43 @@ def test_parse_fills_default_rationale_when_missing():
     p, r = out
     assert p == 0.4
     assert r  # non-empty default
+
+
+# ---- multi-outcome prompt examples ---------------------------------------
+
+
+def test_multi_outcome_prompt_includes_both_favorite_and_longshot_examples():
+    """The multi-outcome prompt should cover both directions: outcomes[0]
+    as favorite (above uniform) AND outcomes[0] as longshot (below uniform).
+    Without the longshot example the LLM tends to default to uniform when
+    it doesn't recognize the candidate as a market favorite, losing real
+    Brier on dark-horse / non-contender outcomes[0] cases."""
+    event = {
+        "title": "Who will win?",
+        "category": "Sports",
+        "close_time": "2026-12-31T23:59:59Z",
+        "outcomes": ["A", "B", "C", "D", "E"],  # 5 outcomes triggers multi
+    }
+    prompt = _build_user_prompt(event)
+    # Both directions present
+    assert "FAVORITE" in prompt
+    assert "LONGSHOT" in prompt
+    # The favorite case shows exceeding uniform (e.g. Boston 22% > 3.3%)
+    assert "EXCEED" in prompt
+    # The longshot case shows going below uniform
+    assert "BELOW uniform" in prompt
+    # Both shapes still in the marginal-probability frame
+    assert "MARGINAL probability" in prompt
+
+
+def test_multi_outcome_prompt_does_not_fire_on_binary():
+    """Binary events should not get the multi-outcome top-K coaching."""
+    event = {
+        "title": "Will A beat B?",
+        "category": "Sports",
+        "close_time": "2026-12-31T23:59:59Z",
+        "outcomes": ["A", "B"],
+    }
+    prompt = _build_user_prompt(event)
+    assert "FAVORITE" not in prompt
+    assert "LONGSHOT" not in prompt
