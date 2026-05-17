@@ -97,3 +97,62 @@ def test_log_prediction_merges_extra_metadata(tmp_path: Path, monkeypatch):
     assert r["metadata"]["path"] == "llm-grounded"
     assert r["metadata"]["p_yes_pre_calibration"] == pytest.approx(0.62)
     assert r["metadata"]["deadline_hit"] is False
+
+
+# ---- stamped path beats classify_path fallback --------------------------
+
+
+def test_log_prediction_prefers_stamped_path_over_rationale(
+    tmp_path: Path, monkeypatch
+):
+    """When the producer stamps metadata.path, log_prediction must NOT
+    re-derive the path from the rationale. The producer knows which branch
+    it took; the rationale regex is a fragile inverse and corrupts the
+    calibration table when rationales compose (e.g. tail-anchor + guardrail).
+    """
+    target = tmp_path / "preds.jsonl"
+    monkeypatch.setenv("PREDICTION_LOG_PATH", str(target))
+    log_prediction(
+        {"market_ticker": "X", "category": "Sports", "outcomes": ["A", "B"]},
+        0.62,
+        # Rationale text classify_path would map to "guardrail-anchored":
+        "depth-mid 0.500; guardrail anchored 0.821→0.628",
+        # …but the producer stamps the true branch:
+        metadata={"path": "tail-anchor"},
+    )
+    r = json.loads(target.read_text().strip())
+    assert r["metadata"]["path"] == "tail-anchor"
+
+
+def test_log_prediction_falls_back_to_classify_path_when_absent(
+    tmp_path: Path, monkeypatch
+):
+    target = tmp_path / "preds.jsonl"
+    monkeypatch.setenv("PREDICTION_LOG_PATH", str(target))
+    # No path in metadata → classify_path must run on the rationale.
+    log_prediction(
+        {"market_ticker": "X", "category": "Politics", "outcomes": ["Yes", "No"]},
+        0.5,
+        "kalshi fetch failed; LLM (speculative, α_base=0.15, raw=0.40)",
+        metadata={"version": "v3.14"},  # other metadata, no path
+    )
+    r = json.loads(target.read_text().strip())
+    assert r["metadata"]["path"] == "llm-speculative"
+    assert r["metadata"]["version"] == "v3.14"
+
+
+def test_log_prediction_falls_back_when_path_is_empty_string(
+    tmp_path: Path, monkeypatch
+):
+    """An empty / falsy `path` field shouldn't suppress the classify_path
+    fallback. Producers that pass `path=""` (e.g. unknown) get the regex."""
+    target = tmp_path / "preds.jsonl"
+    monkeypatch.setenv("PREDICTION_LOG_PATH", str(target))
+    log_prediction(
+        {"market_ticker": "X", "category": "Sports", "outcomes": ["A", "B"]},
+        0.5,
+        "tail-anchor 0.97→0.956 (α=0.03)",
+        metadata={"path": ""},
+    )
+    r = json.loads(target.read_text().strip())
+    assert r["metadata"]["path"] == "tail-anchor"

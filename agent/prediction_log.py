@@ -141,7 +141,6 @@ def log_prediction(
         path = get_log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         meta: dict[str, Any] = {
-            "path": classify_path(rationale),
             "category": (event.get("category") or "") if isinstance(event, dict) else "",
             "n_outcomes": (
                 len(event.get("outcomes") or []) if isinstance(event, dict) else 0
@@ -149,6 +148,10 @@ def log_prediction(
         }
         if metadata:
             meta.update(metadata)
+        # Prefer the path stamped by the producer; only re-derive from the
+        # rationale text for legacy / external entries that didn't stamp.
+        if "path" not in meta or not meta["path"]:
+            meta["path"] = classify_path(rationale)
         entry = {
             "ts": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             "event": event,

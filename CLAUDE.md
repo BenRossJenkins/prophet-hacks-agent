@@ -31,7 +31,11 @@ predict(event):
        framing + top-K worked examples in the prompt. Retry once
        with web_search=False on total failure.
     5. If LLM also fails: uniform 1/N across outcomes.
-    Final distribution always normalized to sum=1.
+    Final distribution always normalized to sum=1; the served p_yes
+    (for logging / calibration) is set to dist[0].probability AFTER
+    normalization so it stays in sync with what the server scores
+    against (v3.14 — earlier versions used a separately-computed
+    median that could disagree with dist[0]).
 
   Binary (2 outcomes):
   1. Fetch Kalshi market by market_ticker.
@@ -67,14 +71,24 @@ predict(event):
      tail-anchor triage handle the cases the denylist used to gate.)
   8. Market sanity guardrail: if final p deviates >0.30 from a deep
      liquid Kalshi mid (vol_24h ≥ $100k), anchor 0.6/0.4 toward market.
-  9. Path-stratified calibration (binary events only): classify the
-     rationale into one of ~13 pipeline-branch labels (tail-anchor,
-     kalshi-anchor, kalshi+poly-blend, guardrail-anchored, prior,
-     llm-decisive, llm-grounded, llm-speculative, multi-outcome-kalshi,
-     multi-outcome-poly, multi-outcome-blend, multi-outcome-llm,
-     multi-outcome-uniform). Look up that stratum's table from
-     GCS-backed payload (60s cache), require n ≥ MIN_BUCKET_N_FOR_PATH
-     (=5) in the matching bucket — else fall back to the global table.
+  9. Path-stratified calibration (binary events only). The producing
+     branch is stamped into PredictionResponse.path at wrap-time
+     (v3.14) — one of ~15 labels: tail-anchor, kalshi-anchor,
+     kalshi+poly-blend, guardrail-anchored, prior, llm-decisive,
+     llm-grounded, llm-speculative, poly-only, uniform,
+     multi-outcome-kalshi, multi-outcome-poly, multi-outcome-blend,
+     multi-outcome-llm, multi-outcome-uniform. log_prediction prefers
+     metadata.path from the producer; classify_path regex is the
+     legacy fallback for entries that didn't stamp.
+
+     Look up that stratum's table from GCS-backed payload (60s cache),
+     require n ≥ MIN_BUCKET_N_FOR_PATH (=3, lowered from 5 in v3.14
+     once Beta-Bernoulli shrinkage was added) in the matching bucket —
+     else fall back to the global table. Per-bucket yes-rates are
+     Beta-Bernoulli shrunk toward the bucket's mean_p with prior
+     strength N_0=10:
+       posterior = (n * mean_actual + N_0 * mean_p) / (n + N_0)
+     so a 3-event "all yes" bucket at mean_p=0.6 outputs 0.69, not 1.0.
      The final shift is bounded to ±MAX_CALIBRATION_SHIFT (=0.05) so a
      noisy small-N bucket can't yank a confident prediction wildly off.
   10. Wrap p_yes into {market: outcomes[0], probability: p},
@@ -82,6 +96,8 @@ predict(event):
       [0.01, 0.99] per submission contract.
   11. Log every prediction to PREDICTION_LOG_PATH (local FS) AND
       PREDICTION_LOG_GCS_PREFIX (one object per event) for durability.
+      Each log entry carries metadata.path (stamped at producer) and
+      metadata.version (AGENT_VERSION) for post-eval attribution.
 ```
 
 Module map:
@@ -95,8 +111,8 @@ Module map:
 - `agent/sports.py` — ESPN moneyline-derived prior for Sports
 - `agent/manifold.py` — Manifold-backed prior for Politics/World/Companies/Sports fallback
 - `agent/llm.py` — multi-vendor LLM ensemble (Anthropic / OpenAI / Google)
-- `agent/calibrate.py` — path-stratified calibration table (GCS, daily refit, bounded ±0.05 shift)
-- `agent/prediction_log.py` — defensive append-only log of every forecast
+- `agent/calibrate.py` — path-stratified calibration table (GCS, daily refit, bounded ±0.05 shift, Beta-Bernoulli per-bucket shrinkage with N_0=10, `check_calibration_diff` guard for the daily refit cron)
+- `agent/prediction_log.py` — defensive append-only log of every forecast; prefers producer-stamped `metadata.path`, falls back to `classify_path` regex for legacy entries
 
 ## Conventions
 
@@ -197,6 +213,25 @@ internally. Additional shrinkage on top would double-count.
    (`/tmp/market_baseline_compare.py` pattern — local fixture
    comparison against raw Kalshi mid) to verify the per-category
    deltas don't regress.
+
+8. **`_wrap_binary` requires `path=`** (v3.14). Every call site must
+   pass the producing pipeline branch as a kwarg. Forgetting it raises
+   TypeError at call time — which is intentional: it's the only way
+   to catch missing stamps before they silently fall back to the
+   `classify_path` regex and corrupt the path-stratified calibration
+   table. If you add a new branch, add the path label to the same
+   list `log_prediction` and `classify_path` know about, and write
+   one regression test in `tests/test_predict.py` asserting
+   `entry["metadata"]["path"]` matches.
+
+9. **Calibration diff-sanity is fail-closed** (v3.14). The daily
+   `scripts/fit_calibration.py` cron loads the previously-published
+   table from GCS, calls `check_calibration_diff`, and exits 3 (no
+   save, no GCS push) if any bucket with `n < 20` moved by more than
+   `0.20` since the prior table. The live agent keeps using the
+   already-published table — preferred over publishing a noisy one.
+   `--skip-diff-sanity` overrides; only use it after inspecting the
+   resolved-predictions for actual anomalies.
 
 ## Backtest workflow
 

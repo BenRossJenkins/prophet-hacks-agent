@@ -1100,3 +1100,290 @@ def test_predict_output_always_in_contract_range():
     with patch("agent.predict.get_market", return_value=market):
         out = predict(_event())
     assert 0.01 <= out["p_yes"] <= 0.99
+
+
+# ---- path stamping at producer (v3.14) -----------------------------------
+#
+# These verify that each pipeline branch stamps its own path label into the
+# prediction log instead of relying on the rationale-regex classifier. Each
+# test calls predict(), reads the JSONL log written via the test-wide
+# PREDICTION_LOG_PATH fixture, and asserts metadata.path.
+
+
+def _last_log_entry(tmp_path):
+    import json
+    log_file = tmp_path / "predictions.jsonl"
+    lines = log_file.read_text().strip().splitlines()
+    return json.loads(lines[-1])
+
+
+def test_path_stamp_tail_anchor(tmp_path):
+    """A confident high-volume Kalshi tail price → path='tail-anchor'."""
+    market = {
+        "yes_bid_dollars": "0.97",
+        "yes_ask_dollars": "0.98",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.02",
+        "no_ask_dollars": "0.03",
+        "last_price_dollars": "0.975",
+        "volume_24h_fp": "10000",  # >> TAIL_MIN_VOL_24H
+        "updated_time": _fresh_now_iso(),
+    }
+    with patch("agent.predict.get_market", return_value=market):
+        predict(_event())
+    entry = _last_log_entry(tmp_path)
+    assert entry["metadata"]["path"] == "tail-anchor"
+
+
+def test_path_stamp_kalshi_anchor_when_no_poly_category(tmp_path):
+    """Mid-band Kalshi price in a category not on Polymarket allowlist."""
+    market = {
+        "yes_bid_dollars": "0.55",
+        "yes_ask_dollars": "0.57",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.43",
+        "no_ask_dollars": "0.45",
+        "last_price_dollars": "0.56",
+        "volume_24h_fp": "1000",
+        "updated_time": _fresh_now_iso(),
+    }
+    e = _event()
+    e["category"] = "Test"  # Not in POLYMARKET_CATEGORIES
+    with patch("agent.predict.get_market", return_value=market):
+        predict(e)
+    entry = _last_log_entry(tmp_path)
+    assert entry["metadata"]["path"] == "kalshi-anchor"
+
+
+def test_path_stamp_kalshi_poly_blend_when_poly_contributes(tmp_path):
+    """Politics category, mid-band kalshi, poly disagrees → blend path."""
+    market = {
+        "yes_bid_dollars": "0.55",
+        "yes_ask_dollars": "0.57",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.43",
+        "no_ask_dollars": "0.45",
+        "last_price_dollars": "0.56",
+        "volume_24h_fp": "1000",  # below SAFE_BAND_MIN_VOL_24H → always blend
+        "updated_time": _fresh_now_iso(),
+    }
+    e = _event()
+    e["category"] = "Politics"
+    # Poly returns a price meaningfully different from Kalshi (0.40 vs 0.56),
+    # with enough volume to clear MIN_POLYMARKET_VOLUME_FOR_BLEND.
+    with patch("agent.predict.get_market", return_value=market), patch(
+        "agent.predict.polymarket_quote",
+        return_value=(0.40, 20_000.0, "poly p=0.40, vol=$20k"),
+    ):
+        predict(e)
+    entry = _last_log_entry(tmp_path)
+    assert entry["metadata"]["path"] == "kalshi+poly-blend"
+
+
+def test_path_stamp_kalshi_anchor_when_poly_skipped_at_floor(tmp_path):
+    """Politics + low-vol Poly → blend is skipped → still kalshi-anchor."""
+    market = {
+        "yes_bid_dollars": "0.55",
+        "yes_ask_dollars": "0.57",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.43",
+        "no_ask_dollars": "0.45",
+        "last_price_dollars": "0.56",
+        "volume_24h_fp": "1000",
+        "updated_time": _fresh_now_iso(),
+    }
+    e = _event()
+    e["category"] = "Politics"
+    # Poly volume below MIN_POLYMARKET_VOLUME_FOR_BLEND → skip-floor.
+    with patch("agent.predict.get_market", return_value=market), patch(
+        "agent.predict.polymarket_quote",
+        return_value=(0.40, 100.0, "poly thin"),
+    ):
+        predict(e)
+    entry = _last_log_entry(tmp_path)
+    assert entry["metadata"]["path"] == "kalshi-anchor"
+
+
+def test_path_stamp_guardrail_anchored_overrides_blend(tmp_path):
+    """When the market-sanity guardrail fires, it overwrites the path
+    stamp with 'guardrail-anchored' regardless of what came before."""
+    market = {
+        "yes_bid_dollars": "0.80",
+        "yes_ask_dollars": "0.82",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.18",
+        "no_ask_dollars": "0.20",
+        "last_price_dollars": "0.81",
+        # Volume large enough to trigger the guardrail check.
+        "volume_24h_fp": "200000",
+        "updated_time": _fresh_now_iso(),
+    }
+    e = _event()
+    e["category"] = "Politics"
+    # Poly pulls the prediction way below the deep-liquid Kalshi mid of 0.81;
+    # |our_p - kalshi_mid| > GUARDRAIL_DEVIATION (0.30) → guardrail anchors.
+    with patch("agent.predict.get_market", return_value=market), patch(
+        "agent.predict.polymarket_quote",
+        return_value=(0.10, 500_000.0, "poly says 0.10"),
+    ):
+        predict(e)
+    entry = _last_log_entry(tmp_path)
+    assert entry["metadata"]["path"] == "guardrail-anchored"
+
+
+def test_path_stamp_poly_only_when_kalshi_fetch_fails(tmp_path):
+    """Kalshi unreachable, Polymarket has a quote → path='poly-only'."""
+    e = _event()
+    e["category"] = "Politics"
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.polymarket_quote",
+        return_value=(0.42, 50_000.0, "poly p=0.42"),
+    ):
+        predict(e)
+    entry = _last_log_entry(tmp_path)
+    assert entry["metadata"]["path"] == "poly-only"
+
+
+def test_path_stamp_llm_grounded(tmp_path):
+    """No market data + grounded LLM rationale → path='llm-grounded'."""
+    e = _event()
+    e["category"] = "Test"  # No prior, no poly
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.polymarket_quote", return_value=None
+    ), patch(
+        "agent.predict.llm_forecast_ensemble",
+        return_value=(0.62, "according to recent polls, candidate X leads"),
+    ):
+        predict(e)
+    entry = _last_log_entry(tmp_path)
+    assert entry["metadata"]["path"] == "llm-grounded"
+
+
+def test_path_stamp_llm_speculative(tmp_path):
+    """Base-rate-only rationale → path='llm-speculative'."""
+    e = _event()
+    e["category"] = "Test"
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.polymarket_quote", return_value=None
+    ), patch(
+        "agent.predict.llm_forecast_ensemble",
+        return_value=(0.55, "no grounding evidence; base-rate guess"),
+    ):
+        predict(e)
+    entry = _last_log_entry(tmp_path)
+    assert entry["metadata"]["path"] == "llm-speculative"
+
+
+def test_path_stamp_uniform_when_llm_unavailable(tmp_path):
+    """No market + LLM fails on retry → path='uniform'."""
+    e = _event()
+    e["category"] = "Test"
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.polymarket_quote", return_value=None
+    ), patch("agent.predict.llm_forecast_ensemble", return_value=None):
+        predict(e)
+    entry = _last_log_entry(tmp_path)
+    assert entry["metadata"]["path"] == "uniform"
+
+
+def test_path_stamp_prior_when_typed_handler_fires(tmp_path):
+    """Category prior contributes → path='prior'."""
+    e = _event()
+    e["category"] = "Test"  # not on Polymarket allowlist
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.polymarket_quote", return_value=None
+    ), patch(
+        "agent.predict.category_prior",
+        return_value=(0.7, "test prior fired"),
+    ):
+        predict(e)
+    entry = _last_log_entry(tmp_path)
+    assert entry["metadata"]["path"] == "prior"
+
+
+def test_path_stamp_multi_outcome_kalshi(tmp_path):
+    """Multi-outcome with Kalshi-only event coverage → 'multi-outcome-kalshi'."""
+    e = _event()
+    e["outcomes"] = ["A", "B", "C", "D", "E"]
+    e["category"] = "Sports"
+    kalshi_dist = [
+        {"market": "A", "probability": 0.40},
+        {"market": "B", "probability": 0.20},
+        {"market": "C", "probability": 0.20},
+        {"market": "D", "probability": 0.10},
+        {"market": "E", "probability": 0.10},
+    ]
+    with patch(
+        "agent.predict.kalshi_event_distribution",
+        return_value=(kalshi_dist, 50_000.0, "kalshi event 'X'"),
+    ), patch(
+        "agent.predict.polymarket_event_distribution", return_value=None
+    ):
+        predict(e)
+    entry = _last_log_entry(tmp_path)
+    assert entry["metadata"]["path"] == "multi-outcome-kalshi"
+
+
+def test_path_stamp_multi_outcome_blend(tmp_path):
+    """Both Kalshi and Polymarket provide multi-outcome → 'multi-outcome-blend'."""
+    e = _event()
+    e["outcomes"] = ["A", "B", "C", "D", "E"]
+    e["category"] = "Politics"
+    dist = [
+        {"market": "A", "probability": 0.30},
+        {"market": "B", "probability": 0.25},
+        {"market": "C", "probability": 0.20},
+        {"market": "D", "probability": 0.15},
+        {"market": "E", "probability": 0.10},
+    ]
+    with patch(
+        "agent.predict.kalshi_event_distribution",
+        return_value=(dist, 50_000.0, "kalshi event 'X'"),
+    ), patch(
+        "agent.predict.polymarket_event_distribution",
+        return_value=(dist, 25_000.0, "poly event 'X'"),
+    ):
+        predict(e)
+    entry = _last_log_entry(tmp_path)
+    assert entry["metadata"]["path"] == "multi-outcome-blend"
+
+
+def test_path_stamp_multi_outcome_uniform_when_llm_fails(tmp_path):
+    """Multi-outcome with no market + LLM fails → 'multi-outcome-uniform'."""
+    e = _event()
+    e["outcomes"] = ["A", "B", "C", "D", "E"]
+    with patch(
+        "agent.predict.kalshi_event_distribution", return_value=None
+    ), patch(
+        "agent.predict.polymarket_event_distribution", return_value=None
+    ), patch(
+        "agent.predict.llm_forecast_ensemble_full", return_value=None
+    ):
+        predict(e)
+    entry = _last_log_entry(tmp_path)
+    assert entry["metadata"]["path"] == "multi-outcome-uniform"
+
+
+def test_agent_version_logged_with_each_prediction(tmp_path):
+    """Every log entry includes the agent version for post-eval attribution."""
+    from agent.predict import AGENT_VERSION
+    market = {
+        "yes_bid_dollars": "0.55",
+        "yes_ask_dollars": "0.57",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.43",
+        "no_ask_dollars": "0.45",
+        "last_price_dollars": "0.56",
+        "volume_24h_fp": "1000",
+        "updated_time": _fresh_now_iso(),
+    }
+    with patch("agent.predict.get_market", return_value=market):
+        predict(_event())
+    entry = _last_log_entry(tmp_path)
+    assert entry["metadata"]["version"] == AGENT_VERSION

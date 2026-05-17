@@ -25,9 +25,12 @@ import sys
 from pathlib import Path
 
 from agent.calibrate import (
+    _load_from_gcs,
     apply_calibration_data,
+    check_calibration_diff,
     fit_calibration_by_path,
     get_calibration_path,
+    load_calibration_data,
     save_calibration,
 )
 from agent.prediction_log import classify_path
@@ -64,6 +67,15 @@ def main() -> int:
         default=20,
         help="refuse to save calibration if fewer than this many resolutions exist",
     )
+    p.add_argument(
+        "--skip-diff-sanity",
+        action="store_true",
+        help=(
+            "Skip the diff-sanity check that compares the new table against "
+            "the previously-published version. Use only when you've inspected "
+            "the data and verified an unusual shift is real."
+        ),
+    )
     args = p.parse_args()
 
     in_path = Path(args.input)
@@ -97,6 +109,35 @@ def main() -> int:
         return 1
 
     out_path = args.output or get_calibration_path()
+
+    # Diff-sanity guard: refuse to overwrite the published table if a
+    # small-N bucket moved by more than CALIBRATION_DIFF_MAX_DELTA since
+    # the previous publish. Catches the "one noisy bad day" failure mode
+    # where the daily cron yanks a bucket the live agent will then apply.
+    gcs_uri = os.environ.get("CALIBRATION_GCS_URI")
+    previous: dict | None = None
+    if gcs_uri:
+        previous = _load_from_gcs(gcs_uri)
+    if previous is None:
+        previous = load_calibration_data(out_path)
+
+    if not args.skip_diff_sanity:
+        ok, problems = check_calibration_diff(payload, previous)
+        if not ok:
+            print(
+                "\n!! CALIBRATION DIFF SANITY FAILED — refusing to publish:",
+                file=sys.stderr,
+            )
+            for msg in problems:
+                print(f"  - {msg}", file=sys.stderr)
+            print(
+                "\nEither (a) wait for more data so the affected buckets "
+                "exceed n=20, or (b) inspect the resolved-predictions for "
+                "anomalies and re-run with --skip-diff-sanity to override.",
+                file=sys.stderr,
+            )
+            return 3
+
     save_calibration(payload, out_path)
     print(f"Calibration table → {out_path}")
 

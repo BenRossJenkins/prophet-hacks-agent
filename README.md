@@ -58,7 +58,14 @@ For binary events:
 7. **Market sanity guardrail**: if final p deviates >0.30 from a deep
    liquid Kalshi mid, anchor 60/40 toward market.
 8. **Path-stratified calibration** when a fitted table is present (GCS,
-   refit daily during eval, ±0.05 shift cap).
+   refit daily during eval, ±0.05 shift cap). The pipeline branch is
+   stamped at the producer (`tail-anchor`, `kalshi-anchor`,
+   `kalshi+poly-blend`, `guardrail-anchored`, `prior`,
+   `llm-{decisive,grounded,speculative}`, etc.) rather than re-derived
+   from the rationale text, so composed rationales don't corrupt
+   stratification. Per-bucket yes-rates are Beta-Bernoulli shrunk
+   toward the bucket's `mean_p` with prior strength `N_0=10` so
+   small-N buckets behave sensibly (`min_n=3`).
 
 For multi-outcome events (3+ outcomes):
 
@@ -178,11 +185,21 @@ no single failure can break a /predict response:
   probabilities summing to 1 and markets matching the event's outcomes.
 - **Bounded calibration shift.** Any single calibration adjustment is
   capped at ±0.05 from the raw prediction so a noisy small-N bucket
-  cannot yank a confident forecast off track.
+  cannot yank a confident forecast off track. Per-bucket yes-rates
+  are additionally Beta-Bernoulli shrunk toward the bucket's mean
+  prediction so a 3-event "all yes" bucket doesn't output `1.0`.
+- **Diff-sanity guard on calibration publishes.** The daily refit
+  loads the previously-published table from GCS, compares each new
+  small-N bucket against its predecessor, and refuses to publish
+  (exit 3) when any small-N bucket moved by more than 0.20. Operators
+  override with `--skip-diff-sanity` only after inspecting the data.
 - **GCS-mirrored prediction log.** Every prediction is also written as a
   per-event JSON object to GCS so the daily calibration refit job has a
   durable read source — predictions survive Cloud Run container
-  restarts and post-hoc audit is possible.
+  restarts and post-hoc audit is possible. The log records the
+  producing pipeline branch and the agent `version` for each entry
+  so post-eval analysis can attribute Brier deltas to specific
+  versions.
 
 The calibration table is refit nightly from resolved questions over the
 eval window; this is a parameter update from observed data, not a
@@ -255,7 +272,7 @@ scripts/               operational utilities
 tests/                 unit tests; tests/fixtures/ for backtest data
 ```
 
-286 tests under `pytest tests/`.
+320 tests under `pytest tests/`.
 
 ## Environment
 

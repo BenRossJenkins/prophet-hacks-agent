@@ -71,6 +71,18 @@ class PredictionResponse(BaseModel):
     # still keys off a single binary probability for binary events.
     p_yes: float | None = Field(default=None, ge=0.01, le=0.99)
     rationale: str | None = None
+    # Internal field stamped at the producing pipeline branch. Excluded
+    # from the wire response — used by log_prediction → calibration
+    # path-stratification so the table doesn't have to re-derive the
+    # branch from free-text rationale. Re-deriving (classify_path) is
+    # order-dependent and corrupts the table when rationales compose.
+    path: str | None = Field(default=None, exclude=True)
+
+
+# v3.14 — path-stamped at producer, Beta-Bernoulli calibration shrinkage,
+# diff-sanity guard on calibration publish, multi-outcome p_yes aligned
+# with dist[0]. Logged with each prediction for post-eval analysis.
+AGENT_VERSION = "v3.14"
 
 
 # Liquidity gates
@@ -266,15 +278,22 @@ def _normalize_distribution(
 
 
 def _wrap_binary(
-    p: float, rationale: str, event: EventRequest
+    p: float, rationale: str, event: EventRequest, *, path: str
 ) -> PredictionResponse:
-    """Build the response from an internal P(outcomes[0])."""
+    """Build the response from an internal P(outcomes[0]).
+
+    `path` is the producing pipeline branch (tail-anchor, kalshi-anchor,
+    kalshi+poly-blend, guardrail-anchored, poly-only, prior, llm-decisive,
+    llm-grounded, llm-speculative, uniform). Required: keeping it
+    mandatory catches missing call sites at test time.
+    """
     p_clamped = max(0.01, min(0.99, p))
     outs = _default_outcomes(event)
     return PredictionResponse(
         probabilities=_binary_distribution(p_clamped, outs),
         p_yes=p_clamped,
         rationale=rationale,
+        path=path,
     )
 
 
@@ -519,24 +538,22 @@ def _blend_with_polymarket(
     kalshi_rationale: str,
     *,
     skip_if_agree_within: float | None = None,
-) -> tuple[float | None, str]:
+) -> tuple[float | None, str, str]:
     """If a Polymarket sibling exists, fold it into the price.
 
-    Three cases:
-      - Both books have signal: volume-weighted average of the two prices.
-      - Only Polymarket has signal (Kalshi illiquid/missing): use Poly price.
-      - Neither: pass kalshi_p (which may itself be None) through unchanged.
+    Returns (p_or_none, rationale, blend_kind). `blend_kind` is one of:
+      - "no-poly"     — category gated, no quote, or pass-through; kalshi unchanged
+      - "poly-only"   — kalshi had no signal; poly carried the price
+      - "skip-floor"  — poly volume below MIN_POLYMARKET_VOLUME_FOR_BLEND
+      - "skip-agree"  — both venues agreed within tolerance
+      - "blend"       — volume-weighted blend of both venues
+      - "blend-equal" — equal-weight blend (both volumes zero)
 
-    When `skip_if_agree_within` is set, AND both books have a price, AND the
-    two prices agree to within that tolerance, return the Kalshi price
-    unchanged. This is the "safe-band agreement gate" — when the venues
-    agree there's no signal to extract, skip the blend.
-
-    Returns (p_or_none, rationale). When category isn't on the Polymarket
-    allowlist or no usable Poly match exists, this is a pass-through.
+    Callers use blend_kind to stamp the correct path label without
+    re-deriving it from the free-text rationale.
     """
     if event.category not in POLYMARKET_CATEGORIES:
-        return kalshi_p, kalshi_rationale
+        return kalshi_p, kalshi_rationale, "no-poly"
 
     try:
         poly = polymarket_quote(event.model_dump())
@@ -545,12 +562,16 @@ def _blend_with_polymarket(
         poly = None
 
     if poly is None:
-        return kalshi_p, kalshi_rationale
+        return kalshi_p, kalshi_rationale, "no-poly"
 
     poly_p, poly_weight, poly_rationale = poly
 
     if kalshi_p is None:
-        return poly_p, f"polymarket-only ({poly_rationale}); kalshi: {kalshi_rationale}"
+        return (
+            poly_p,
+            f"polymarket-only ({poly_rationale}); kalshi: {kalshi_rationale}",
+            "poly-only",
+        )
 
     # Minimum-volume floor: when Kalshi has a real price, a thin
     # Polymarket quote (volume < MIN_POLYMARKET_VOLUME_FOR_BLEND) is
@@ -559,16 +580,25 @@ def _blend_with_polymarket(
     # ratio cap, not an absolute volume floor). Skip the blend in that
     # case — use Kalshi alone.
     if poly_weight < MIN_POLYMARKET_VOLUME_FOR_BLEND:
-        return kalshi_p, (
-            f"{kalshi_rationale}; poly vol ${poly_weight:.0f} < "
-            f"${MIN_POLYMARKET_VOLUME_FOR_BLEND:.0f} floor → skip blend"
+        return (
+            kalshi_p,
+            (
+                f"{kalshi_rationale}; poly vol ${poly_weight:.0f} < "
+                f"${MIN_POLYMARKET_VOLUME_FOR_BLEND:.0f} floor → skip blend"
+            ),
+            "skip-floor",
         )
 
     # Cross-venue agreement check: when both venues quote the same answer,
     # there's no information in their agreement — skip the blend.
     if skip_if_agree_within is not None and abs(kalshi_p - poly_p) <= skip_if_agree_within:
-        return kalshi_p, (
-            f"{kalshi_rationale}; poly agrees ({poly_p:.3f}, |Δ|≤{skip_if_agree_within:.2f}) → skip blend"
+        return (
+            kalshi_p,
+            (
+                f"{kalshi_rationale}; poly agrees ({poly_p:.3f}, "
+                f"|Δ|≤{skip_if_agree_within:.2f}) → skip blend"
+            ),
+            "skip-agree",
         )
 
     kalshi_weight = _kalshi_volume_weight(kalshi_market)
@@ -577,14 +607,33 @@ def _blend_with_polymarket(
         # Both books exist but neither has measurable depth — straight average.
         blended = (kalshi_p + poly_p) / 2
         weight_note = "equal-weight"
+        kind = "blend-equal"
     else:
         blended = (kalshi_p * kalshi_weight + poly_p * poly_weight) / total_weight
         weight_note = (
             f"vol-weighted (kalshi=${kalshi_weight:.0f} poly=${poly_weight:.0f})"
         )
-    return blended, (
-        f"blend {blended:.3f} {weight_note}; kalshi: {kalshi_rationale}; {poly_rationale}"
+        kind = "blend"
+    return (
+        blended,
+        f"blend {blended:.3f} {weight_note}; kalshi: {kalshi_rationale}; {poly_rationale}",
+        kind,
     )
+
+
+# Map _blend_with_polymarket blend_kind → path label for binary events.
+# The "kalshi-anchor" rollup covers the three cases where Kalshi's price
+# was the canonical signal (no poly, poly skipped at floor, poly agreed
+# so blend skipped). "kalshi+poly-blend" only when poly actually changed
+# the price. "poly-only" when Kalshi had no signal.
+_BLEND_KIND_TO_PATH = {
+    "no-poly": "kalshi-anchor",
+    "skip-floor": "kalshi-anchor",
+    "skip-agree": "kalshi-anchor",
+    "blend": "kalshi+poly-blend",
+    "blend-equal": "kalshi+poly-blend",
+    "poly-only": "poly-only",
+}
 
 
 def _market_sanity_check(
@@ -634,7 +683,9 @@ def _market_sanity_check(
         anchored,
         vol_24h,
     )
-    return _wrap_binary(anchored, (resp.rationale or "") + note, event)
+    return _wrap_binary(
+        anchored, (resp.rationale or "") + note, event, path="guardrail-anchored"
+    )
 
 
 def _llm_shrink_alpha(rationale: str, p: float | None = None) -> float:
@@ -702,13 +753,16 @@ def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
     if prior_out is not None:
         p, prior_rationale = prior_out
         p = max(0.01, min(0.99, p))
-        return _wrap_binary(p, f"{reason}; prior: {prior_rationale}", event)
+        return _wrap_binary(
+            p, f"{reason}; prior: {prior_rationale}", event, path="prior"
+        )
 
     if not llm_allowed_for(event.category):
         return _wrap_binary(
             0.5,
             f"{reason}; LLM gated for category='{event.category}'; uniform prior",
             event,
+            path="uniform",
         )
 
     # Ensemble over multiple Claude variants; gracefully degrades to a single
@@ -723,7 +777,9 @@ def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
         out = llm_forecast_ensemble(event_d, with_web_search=False)
         retry_note = " (retry, no-search)"
     if out is None:
-        return _wrap_binary(0.5, f"{reason}; LLM unavailable; uniform prior", event)
+        return _wrap_binary(
+            0.5, f"{reason}; LLM unavailable; uniform prior", event, path="uniform"
+        )
     p_raw, llm_rationale = out
     llm_rationale = llm_rationale + retry_note
     # Force speculative tier on the no-search retry: without web search,
@@ -745,6 +801,7 @@ def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
         p,
         f"{reason}; LLM ({tier}, α_base={alpha_base}, raw={p_raw:.3f}→{p:.3f}): {llm_rationale}",
         event,
+        path=f"llm-{tier}",
     )
 
 
@@ -834,31 +891,37 @@ def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
     # Step 3: combine market signals.
     market_dist: list[dict[str, float]] | None = None
     market_rationale: str = ""
+    market_path: str = ""
     if kalshi_out is not None and poly_out is not None:
         blended, _vol, rat = _blend_multi_outcome_distributions(
             kalshi_out, poly_out, outcomes
         )
         market_dist = blended
         market_rationale = rat
+        market_path = "multi-outcome-blend"
     elif kalshi_out is not None:
         market_dist = kalshi_out[0]
         market_rationale = f"kalshi only; {kalshi_out[2]}"
+        market_path = "multi-outcome-kalshi"
     elif poly_out is not None:
         market_dist = poly_out[0]
         market_rationale = f"poly only; {poly_out[2]}"
+        market_path = "multi-outcome-poly"
 
     if market_dist is not None:
         dist = _normalize_distribution(market_dist, outcomes)
-        p_yes_value = next(
-            (p.probability for p in dist if p.market == outcomes[0]), prior
-        )
-        p_yes_value = max(0.01, min(0.99, p_yes_value))
+        # Align p_yes with dist[0] so calibration / logging see the same
+        # outcomes[0] probability the server scores against. Previously
+        # we pulled p_yes from market_dist (pre-normalize) which could
+        # disagree with dist[0] after normalization.
+        p_yes_value = max(0.01, min(0.99, dist[0].probability)) if dist else prior
         return PredictionResponse(
             probabilities=dist,
             p_yes=p_yes_value,
             rationale=(
                 f"multi-outcome ({n_out} options, top-{k}); {market_rationale}"
             ),
+            path=market_path,
         )
 
     # Step 4: LLM ensemble. Same retry-without-search dance as the binary
@@ -886,6 +949,7 @@ def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
                 f"multi-outcome ({n_out} options, top-{k}); LLM unavailable; "
                 f"uniform 1/N across outcomes"
             ),
+            path="multi-outcome-uniform",
         )
     raw_p, probabilities, llm_rationale = out
 
@@ -907,12 +971,11 @@ def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
                 synthesized.append({"market": o, "probability": per_other})
         dist = _normalize_distribution(synthesized, outcomes)
 
-    # Surface the p_yes (probability of outcomes[0]) for logging / calibration.
-    p_yes_value = next(
-        (p.probability for p in dist if p.market == outcomes[0]),
-        prior,
-    )
-    p_yes_value = max(0.01, min(0.99, p_yes_value))
+    # Align p_yes with dist[0] (post-normalization) — same fix as the
+    # market-distribution branch above. Calibration keys off this value;
+    # keeping it in sync with the served distribution prevents the
+    # median-vs-mean disagreement.
+    p_yes_value = max(0.01, min(0.99, dist[0].probability)) if dist else prior
 
     return PredictionResponse(
         probabilities=dist,
@@ -921,6 +984,7 @@ def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
             f"multi-outcome ({n_out} options, top-{k}, uniform={prior:.3f}); "
             f"raw={raw_p:.3f}; {llm_rationale}"
         ),
+        path="multi-outcome-llm",
     )
 
 
@@ -933,12 +997,15 @@ def _forecast(event: EventRequest) -> PredictionResponse:
     if market is None:
         # Kalshi fetch failed entirely. Try Polymarket as an alternative
         # market-anchor before reaching for priors / LLM.
-        poly_p, poly_rationale = _blend_with_polymarket(
+        poly_p, poly_rationale, blend_kind = _blend_with_polymarket(
             event, None, None, f"kalshi fetch failed for {event.market_ticker}"
         )
         if poly_p is not None:
             p = _shrink_and_clamp(poly_p, alpha=MIN_SHRINK_ALPHA)
-            return _wrap_binary(p, poly_rationale, event)
+            return _wrap_binary(
+                p, poly_rationale, event,
+                path=_BLEND_KIND_TO_PATH.get(blend_kind, "poly-only"),
+            )
         return _llm_fallback(event, reason=f"kalshi fetch failed for {event.market_ticker}")
 
     arb_violated = _no_arb_violated(market)
@@ -960,6 +1027,7 @@ def _forecast(event: EventRequest) -> PredictionResponse:
             p,
             f"tail-anchor {raw_p:.3f}→{p:.3f} (α={TAIL_ANCHOR_SHRINK}, vol24h=${vol_24h:.0f}); {rationale}",
             event,
+            path="tail-anchor",
         )
 
     # Cross-venue agreement gate: in the central band with a liquid book
@@ -973,12 +1041,14 @@ def _forecast(event: EventRequest) -> PredictionResponse:
         and SAFE_BAND_LOW <= raw_p <= SAFE_BAND_HIGH
     )
     if in_safe_band:
-        raw_p, rationale = _blend_with_polymarket(
+        raw_p, rationale, blend_kind = _blend_with_polymarket(
             event, market, raw_p, rationale,
             skip_if_agree_within=CROSS_VENUE_DISAGREE_TOL,
         )
     else:
-        raw_p, rationale = _blend_with_polymarket(event, market, raw_p, rationale)
+        raw_p, rationale, blend_kind = _blend_with_polymarket(
+            event, market, raw_p, rationale
+        )
 
     if raw_p is None:
         return _llm_fallback(event, reason=rationale)
@@ -992,7 +1062,10 @@ def _forecast(event: EventRequest) -> PredictionResponse:
             rationale += f"; stale book {age_h:.1f}h (α ×{STALE_ALPHA_MULTIPLIER:g})"
 
     p = _shrink_and_clamp(raw_p, alpha=alpha)
-    resp = _wrap_binary(p, f"{rationale}; shrunk α={alpha:.3f} → {p:.3f}", event)
+    resp = _wrap_binary(
+        p, f"{rationale}; shrunk α={alpha:.3f} → {p:.3f}", event,
+        path=_BLEND_KIND_TO_PATH.get(blend_kind, "kalshi-anchor"),
+    )
     # Sanity guardrail: if Polymarket blend or anything else pulled us far
     # from a deep liquid Kalshi book, anchor back. No-op otherwise.
     return _market_sanity_check(resp, market, event)
@@ -1019,7 +1092,9 @@ def _maybe_calibrate(
         return resp
     from agent.prediction_log import classify_path  # lazy import
 
-    path = classify_path(resp.rationale or "")
+    # Prefer the path stamped at the producer; fall back to classifying
+    # the rationale for legacy responses that didn't stamp.
+    path = resp.path or classify_path(resp.rationale or "")
     raw = resp.p_yes
     adjusted = apply_calibration_data(raw, data, path=path)
     if adjusted == raw:
@@ -1029,14 +1104,28 @@ def _maybe_calibrate(
         adjusted,
         f"{resp.rationale}; calibrated[{path}] {raw:.3f}→{adjusted:.3f}",
         event,
+        path=path,
     )
+
+
+def _log_metadata(resp: PredictionResponse) -> dict:
+    """Build the log_prediction metadata dict from a response.
+
+    Stamps the producer's path (preferred over rationale-regex classification)
+    and the agent version so post-eval analysis can attribute predictions
+    to the version that produced them.
+    """
+    meta: dict = {"version": AGENT_VERSION}
+    if resp.path:
+        meta["path"] = resp.path
+    return meta
 
 
 def predict(event: dict) -> dict:
     event_obj = EventRequest(**event)
     resp = _forecast(event_obj)
     resp = _maybe_calibrate(resp, event_obj)
-    log_prediction(event, resp.p_yes, resp.rationale)
+    log_prediction(event, resp.p_yes, resp.rationale, metadata=_log_metadata(resp))
     return {
         "probabilities": [
             {"market": p.market, "probability": p.probability}
@@ -1054,7 +1143,9 @@ app = FastAPI(title="Prophet Hacks Forecast Agent")
 async def predict_endpoint(event: EventRequest) -> PredictionResponse:
     resp = _forecast(event)
     resp = _maybe_calibrate(resp, event)
-    log_prediction(event.model_dump(), resp.p_yes, resp.rationale)
+    log_prediction(
+        event.model_dump(), resp.p_yes, resp.rationale, metadata=_log_metadata(resp)
+    )
     return resp
 
 

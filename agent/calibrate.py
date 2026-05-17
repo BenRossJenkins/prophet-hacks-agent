@@ -61,8 +61,28 @@ CALIBRATION_VERSION = 2
 DEFAULT_PATH = "data/calibration.json"
 
 # Minimum samples in a per-path bucket before we trust it over global.
-# Per-path tables fall back to global aggressively at low N.
-MIN_BUCKET_N_FOR_PATH = 5
+# Lowered 5 → 3 in v3.14 once apply_calibration started Beta-Bernoulli
+# shrinking the observed yes-rate toward the bucket's mean prediction
+# (see N_0). The shrinkage handles the small-N noise problem the higher
+# floor was protecting against, so we can use the per-path table earlier
+# in the eval window when buckets are still filling.
+MIN_BUCKET_N_FOR_PATH = 3
+
+# Beta-Bernoulli prior strength for apply_calibration. The raw observed
+# yes-rate in a bucket is a Bernoulli sample, not a probability. Treating
+# the prediction (mean_p) as a Beta(N_0 * mean_p, N_0 * (1 - mean_p)) prior,
+# the posterior mean after observing `n` events with `k` successes is:
+#
+#     (k + N_0 * mean_p) / (n + N_0)
+#   = (n * mean_actual + N_0 * mean_p) / (n + N_0)
+#
+# N_0 = 10 means a single-event bucket gets pulled almost entirely back
+# toward mean_p (10/11 prior weight); a 90-event bucket trusts the
+# observed rate at 90/100. The number was picked to make
+# MIN_BUCKET_N_FOR_PATH=3 buckets meaningful but not catastrophically
+# noisy: with N_0=10 a 3-event "all yes" bucket at mean_p=0.6 becomes
+# (3*1.0 + 10*0.6) / 13 = 0.69, not 1.0. Sensible.
+N_0 = 10
 
 # Maximum amount a single calibration correction can shift the raw
 # prediction. Protects against a small bucket (e.g. 5-7 events) with an
@@ -183,12 +203,35 @@ def _bucket_for(
     return None
 
 
+def _beta_bernoulli_posterior(bucket: dict[str, Any]) -> float:
+    """Shrink the bucket's observed yes-rate toward its mean prediction.
+
+    Posterior mean of Beta(N_0 * mean_p, N_0 * (1 - mean_p)) + Bernoulli
+    observations: (n * mean_actual + N_0 * mean_p) / (n + N_0). At low n
+    this lands near mean_p (effectively a no-op calibration); at high n
+    it converges to the raw observed rate.
+    """
+    try:
+        n = int(bucket.get("n", 0))
+        mean_actual = float(bucket.get("mean_actual", 0.5))
+        mean_p = float(bucket.get("mean_p", mean_actual))
+    except (TypeError, ValueError):
+        return float(bucket.get("mean_actual", 0.5))
+    if n <= 0:
+        return mean_p
+    return (n * mean_actual + N_0 * mean_p) / (n + N_0)
+
+
 def apply_calibration(p_yes: float, table: list[dict[str, Any]]) -> float:
-    """Replace p_yes with the bucket's observed yes-rate. No-op if no bucket."""
+    """Replace p_yes with the bucket's Beta-Bernoulli-shrunk yes-rate.
+
+    No-op if no bucket. See `_beta_bernoulli_posterior` for the shrinkage
+    formula.
+    """
     bucket = _bucket_for(p_yes, table)
     if bucket is None:
         return p_yes
-    return max(0.01, min(0.99, float(bucket["mean_actual"])))
+    return max(0.01, min(0.99, _beta_bernoulli_posterior(bucket)))
 
 
 def _bound_shift(raw: float, adjusted: float) -> float:
@@ -230,9 +273,77 @@ def apply_calibration_data(
         path_table = (data.get("by_path") or {}).get(path) or []
         bucket = _bucket_for(p_yes, path_table)
         if bucket is not None and int(bucket.get("n", 0)) >= min_n:
-            return _bound_shift(p_yes, float(bucket["mean_actual"]))
+            return _bound_shift(p_yes, _beta_bernoulli_posterior(bucket))
     adjusted = apply_calibration(p_yes, data.get("global") or [])
     return _bound_shift(p_yes, adjusted)
+
+
+# Diff-sanity guard for the daily refit cron. A bad day of resolved
+# predictions (e.g., one event cluster skews a small-N bucket) can yank
+# a bucket's mean_actual hard. CALIBRATION_DIFF_MAX_DELTA bounds the
+# tolerated single-bucket change between the previous and new tables;
+# only small-N buckets are gated (n < CALIBRATION_DIFF_SMALL_N) because
+# a large-N bucket that legitimately shifts has earned the move.
+CALIBRATION_DIFF_MAX_DELTA = 0.20
+CALIBRATION_DIFF_SMALL_N = 20
+
+
+def check_calibration_diff(
+    new_payload: dict[str, Any],
+    previous_payload: dict[str, Any] | None,
+    *,
+    max_delta: float = CALIBRATION_DIFF_MAX_DELTA,
+    small_n: int = CALIBRATION_DIFF_SMALL_N,
+) -> tuple[bool, list[str]]:
+    """Diff-sanity check before publishing a refit calibration table.
+
+    Returns (ok, problems). `ok=False` means at least one bucket in the
+    new payload shifted by more than `max_delta` from its previous-table
+    counterpart while still being small-N (n < small_n) — exactly the
+    "one noisy bad day yanks a bucket" case the daily cron should
+    fail-closed on. A large-N bucket that shifts is left alone: it has
+    earned the move.
+
+    When there's no previous payload (first publish), returns ok=True
+    with no problems.
+    """
+    if previous_payload is None:
+        return True, []
+
+    problems: list[str] = []
+
+    def _diff_table(label: str, new_tbl, prev_tbl) -> None:
+        prev_by_lo = {b.get("bucket_lo"): b for b in (prev_tbl or [])}
+        for b in new_tbl or []:
+            try:
+                n_new = int(b.get("n", 0))
+                new_actual = float(b.get("mean_actual", 0.5))
+            except (TypeError, ValueError):
+                continue
+            if n_new >= small_n:
+                continue
+            prev_b = prev_by_lo.get(b.get("bucket_lo"))
+            if prev_b is None:
+                continue
+            try:
+                prev_actual = float(prev_b.get("mean_actual", 0.5))
+            except (TypeError, ValueError):
+                continue
+            delta = abs(new_actual - prev_actual)
+            if delta > max_delta:
+                problems.append(
+                    f"[{label}] bucket lo={b.get('bucket_lo')}: n={n_new} "
+                    f"(<{small_n}), mean_actual {prev_actual:.3f} → "
+                    f"{new_actual:.3f} (|Δ|={delta:.3f} > {max_delta:.2f})"
+                )
+
+    _diff_table("global", new_payload.get("global"), previous_payload.get("global"))
+    new_by_path = new_payload.get("by_path") or {}
+    prev_by_path = previous_payload.get("by_path") or {}
+    for path in sorted(new_by_path):
+        _diff_table(f"by_path[{path}]", new_by_path[path], prev_by_path.get(path))
+
+    return (not problems), problems
 
 
 def save_calibration(

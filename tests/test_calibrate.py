@@ -50,9 +50,12 @@ def test_fit_rejects_low_n_bins():
         fit_calibration([_row(0.5, "yes")], n_bins=1)
 
 
-def test_apply_replaces_with_actual():
+def test_apply_replaces_with_beta_bernoulli_shrunk_actual():
+    """v3.14: apply_calibration shrinks mean_actual toward mean_p with
+    Beta-Bernoulli posterior, N_0=10. With n=10 the shrinkage is exactly
+    50/50, so (n*0.8 + 10*0.35) / (n+10) = (8 + 3.5) / 20 = 0.575."""
     table = [{"bucket_lo": 0.3, "bucket_hi": 0.4, "n": 10, "mean_p": 0.35, "mean_actual": 0.8}]
-    assert apply_calibration(0.35, table) == pytest.approx(0.8)
+    assert apply_calibration(0.35, table) == pytest.approx(0.575)
 
 
 def test_apply_passes_through_outside_buckets():
@@ -61,7 +64,9 @@ def test_apply_passes_through_outside_buckets():
 
 
 def test_apply_clamps_to_contract_range():
-    table = [{"bucket_lo": 0.0, "bucket_hi": 0.1, "n": 10, "mean_p": 0.05, "mean_actual": 0.0}]
+    """Clamp still applies after B-B shrinkage. With n=1000, mean_p=0.0,
+    mean_actual=0.0, the shrunk posterior is 0 → clamped to 0.01 floor."""
+    table = [{"bucket_lo": 0.0, "bucket_hi": 0.1, "n": 1000, "mean_p": 0.0, "mean_actual": 0.0}]
     assert apply_calibration(0.05, table) == 0.01
 
 
@@ -70,8 +75,10 @@ def test_apply_empty_table_passes_through():
 
 
 def test_apply_handles_inclusive_upper_boundary():
+    """Inclusive upper-boundary lookup still works. n=5 shrinks heavily:
+    (5*0.85 + 10*0.95) / 15 = (4.25 + 9.5) / 15 ≈ 0.9167."""
     table = [{"bucket_lo": 0.9, "bucket_hi": 1.0, "n": 5, "mean_p": 0.95, "mean_actual": 0.85}]
-    assert apply_calibration(0.99, table) == pytest.approx(0.85)
+    assert apply_calibration(0.99, table) == pytest.approx(13.75 / 15)
 
 
 def test_save_load_roundtrip(tmp_path: Path):
@@ -146,29 +153,186 @@ def test_apply_calibration_data_uses_path_when_n_sufficient():
             ]
         },
     }
-    # Path bucket has n=20 >= min_n: use it. |0.92 - 0.95| = 0.03 < cap.
-    assert apply_calibration_data(0.95, data, path="tail-anchor") == pytest.approx(0.92)
-    # No path provided → global. |0.94 - 0.95| = 0.01 < cap.
-    assert apply_calibration_data(0.95, data) == pytest.approx(0.94)
+    # Path bucket has n=20 ≥ min_n=3, N_0=10 →
+    #   (20*0.92 + 10*0.95) / 30 = 27.9 / 30 = 0.93.
+    # |0.93 - 0.95| = 0.02 < 0.05 cap → 0.93.
+    assert apply_calibration_data(0.95, data, path="tail-anchor") == pytest.approx(0.93)
+    # No path provided → global. n=100 →
+    #   (100*0.94 + 10*0.95) / 110 = 103.5 / 110 ≈ 0.9409.
+    assert apply_calibration_data(0.95, data) == pytest.approx(103.5 / 110)
 
 
 def test_apply_calibration_data_falls_back_to_global_at_low_n():
-    from agent.calibrate import apply_calibration_data
+    from agent.calibrate import MIN_BUCKET_N_FOR_PATH, apply_calibration_data
 
     # Use shifts within the ±0.05 cap so we test only the fallback logic.
+    # Per-path bucket has n=2 < MIN_BUCKET_N_FOR_PATH (3 in v3.14): ignored.
+    assert MIN_BUCKET_N_FOR_PATH == 3
     data = {
         "global": [
             {"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 50, "mean_p": 0.55, "mean_actual": 0.58}
         ],
         "by_path": {
             "tail-anchor": [
-                # n=2, below MIN_BUCKET_N_FOR_PATH (5) — should be ignored.
                 {"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 2, "mean_p": 0.55, "mean_actual": 0.52}
             ]
         },
     }
-    # Path bucket exists but n<min — falls back to global.
-    assert apply_calibration_data(0.55, data, path="tail-anchor") == pytest.approx(0.58)
+    # Falls back to global. B-B with n=50: (50*0.58 + 10*0.55) / 60 = 0.575.
+    assert apply_calibration_data(0.55, data, path="tail-anchor") == pytest.approx(0.575)
+
+
+# ---- Beta-Bernoulli shrinkage (v3.14) -----------------------------------
+
+
+def test_beta_bernoulli_small_n_shrinks_toward_mean_p():
+    """At very small n, the posterior should sit close to the mean prediction
+    rather than the noisy observed rate. With n=1, mean_p=0.30, mean_actual=1.0,
+    raw rate is 1.0 but posterior is (1*1.0 + 10*0.30) / 11 = 4.0/11 ≈ 0.364."""
+    table = [{"bucket_lo": 0.3, "bucket_hi": 0.4, "n": 1, "mean_p": 0.30, "mean_actual": 1.0}]
+    assert apply_calibration(0.35, table) == pytest.approx(4.0 / 11)
+
+
+def test_beta_bernoulli_large_n_converges_to_observed_rate():
+    """At large n, the prior weight becomes negligible and the posterior
+    approaches mean_actual. With n=1000, mean_p=0.50, mean_actual=0.30,
+    posterior = (1000*0.30 + 10*0.50) / 1010 ≈ 0.302."""
+    table = [{"bucket_lo": 0.4, "bucket_hi": 0.5, "n": 1000, "mean_p": 0.50, "mean_actual": 0.30}]
+    out = apply_calibration(0.45, table)
+    assert out == pytest.approx(305.0 / 1010)
+    # And it's within 0.005 of the unshrunk rate.
+    assert abs(out - 0.30) < 0.005
+
+
+# ---- diff-sanity guard (v3.14) ------------------------------------------
+
+
+def test_diff_sanity_passes_when_no_previous_payload():
+    """First publish has no previous version to diff against. Should pass."""
+    from agent.calibrate import check_calibration_diff
+
+    new_payload = {
+        "global": [{"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 5, "mean_p": 0.55, "mean_actual": 0.90}],
+        "by_path": {},
+    }
+    ok, problems = check_calibration_diff(new_payload, None)
+    assert ok is True
+    assert problems == []
+
+
+def test_diff_sanity_passes_when_changes_are_small():
+    """A small change in a small-N bucket is fine."""
+    from agent.calibrate import check_calibration_diff
+
+    prev = {
+        "global": [{"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 5, "mean_p": 0.55, "mean_actual": 0.50}],
+        "by_path": {},
+    }
+    new = {
+        "global": [{"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 6, "mean_p": 0.55, "mean_actual": 0.55}],
+        "by_path": {},
+    }
+    ok, problems = check_calibration_diff(new, prev)
+    assert ok is True
+    assert problems == []
+
+
+def test_diff_sanity_blocks_big_shift_in_small_n_bucket():
+    """A 0.30 shift in a small-N (n=5) bucket should fail-closed."""
+    from agent.calibrate import check_calibration_diff
+
+    prev = {
+        "global": [{"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 5, "mean_p": 0.55, "mean_actual": 0.50}],
+        "by_path": {},
+    }
+    new = {
+        "global": [{"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 7, "mean_p": 0.55, "mean_actual": 0.80}],
+        "by_path": {},
+    }
+    ok, problems = check_calibration_diff(new, prev)
+    assert ok is False
+    assert len(problems) == 1
+    assert "0.500" in problems[0] and "0.800" in problems[0]
+
+
+def test_diff_sanity_allows_big_shift_in_large_n_bucket():
+    """A bucket with n >= small_n threshold has earned the shift — let it through."""
+    from agent.calibrate import check_calibration_diff
+
+    prev = {
+        "global": [{"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 50, "mean_p": 0.55, "mean_actual": 0.50}],
+        "by_path": {},
+    }
+    new = {
+        "global": [{"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 60, "mean_p": 0.55, "mean_actual": 0.80}],
+        "by_path": {},
+    }
+    ok, problems = check_calibration_diff(new, prev)
+    assert ok is True
+    assert problems == []
+
+
+def test_diff_sanity_checks_by_path_tables_too():
+    """A noisy small-N per-path bucket also fails-closed."""
+    from agent.calibrate import check_calibration_diff
+
+    prev = {
+        "global": [],
+        "by_path": {
+            "llm-speculative": [
+                {"bucket_lo": 0.6, "bucket_hi": 0.7, "n": 3, "mean_p": 0.65, "mean_actual": 0.30}
+            ],
+        },
+    }
+    new = {
+        "global": [],
+        "by_path": {
+            "llm-speculative": [
+                {"bucket_lo": 0.6, "bucket_hi": 0.7, "n": 4, "mean_p": 0.65, "mean_actual": 0.90}
+            ],
+        },
+    }
+    ok, problems = check_calibration_diff(new, prev)
+    assert ok is False
+    assert any("by_path[llm-speculative]" in p for p in problems)
+
+
+def test_diff_sanity_skips_new_buckets_that_did_not_exist_previously():
+    """A bucket present in new but not in previous can't be diffed — leave it alone."""
+    from agent.calibrate import check_calibration_diff
+
+    prev = {"global": [], "by_path": {}}
+    new = {
+        "global": [{"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 3, "mean_p": 0.55, "mean_actual": 0.92}],
+        "by_path": {},
+    }
+    ok, problems = check_calibration_diff(new, prev)
+    assert ok is True
+    assert problems == []
+
+
+def test_diff_sanity_threshold_tunable():
+    """Custom max_delta argument."""
+    from agent.calibrate import check_calibration_diff
+
+    prev = {
+        "global": [{"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 5, "mean_p": 0.55, "mean_actual": 0.50}],
+        "by_path": {},
+    }
+    new = {
+        "global": [{"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 6, "mean_p": 0.55, "mean_actual": 0.62}],
+        "by_path": {},
+    }
+    # |0.62 - 0.50| = 0.12. Default 0.20 passes; strict 0.10 fails.
+    assert check_calibration_diff(new, prev)[0] is True
+    assert check_calibration_diff(new, prev, max_delta=0.10)[0] is False
+
+
+def test_beta_bernoulli_zero_n_returns_mean_p():
+    """An empty bucket (n=0) — should never happen in practice, but the
+    formula divides by (n + N_0) so it's safe; posterior just equals mean_p."""
+    table = [{"bucket_lo": 0.5, "bucket_hi": 0.6, "n": 0, "mean_p": 0.55, "mean_actual": 0.0}]
+    assert apply_calibration(0.55, table) == pytest.approx(0.55)
 
 
 def test_apply_calibration_data_no_data_passes_through():
@@ -200,7 +364,7 @@ def test_apply_calibration_data_caps_shift_to_max_delta():
 
 
 def test_apply_calibration_data_small_shift_passes_unchanged():
-    """When the calibration correction is within the bound, no clipping."""
+    """When the B-B-shrunk calibration correction is within the bound, no clipping."""
     from agent.calibrate import apply_calibration_data
 
     data = {
@@ -210,8 +374,9 @@ def test_apply_calibration_data_small_shift_passes_unchanged():
         "by_path": {},
     }
     out = apply_calibration_data(0.55, data)
-    # |0.58 - 0.55| = 0.03 < 0.05 cap → no clipping.
-    assert out == pytest.approx(0.58)
+    # B-B: (50*0.58 + 10*0.55) / 60 = 0.575.
+    # |0.575 - 0.55| = 0.025 < 0.05 cap → no clipping.
+    assert out == pytest.approx(0.575)
 
 
 def test_apply_calibration_data_cap_applies_to_path_lookups_too():
