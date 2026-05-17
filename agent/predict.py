@@ -360,6 +360,15 @@ SAFE_BAND_HIGH = 0.80
 SAFE_BAND_MIN_VOL_24H = 10_000  # USD — only consider skip when Kalshi is liquid
 CROSS_VENUE_DISAGREE_TOL = 0.03   # |kalshi - poly|; below this → skip the blend
 
+# Minimum Polymarket 24h volume (USD) to include in the cross-venue blend
+# WHEN Kalshi also has a price. Below this floor, a Polymarket quote is
+# probably a thin / stale secondary listing whose price contains more
+# noise than signal — blending it in gives an outlier 25% weight (per
+# KALSHI_POLY_MAX_WEIGHT-style cap) to bad data. When only Polymarket
+# has a quote (no Kalshi signal) we keep using it regardless; some
+# signal beats no signal.
+MIN_POLYMARKET_VOLUME_FOR_BLEND = 5_000.0
+
 # Market-deviation sanity guardrail. When our final prediction differs
 # materially from a deep liquid Kalshi book, one of us is wrong — and at
 # this volume threshold the asymmetric Brier penalty (a confident
@@ -528,6 +537,18 @@ def _blend_with_polymarket(
     if kalshi_p is None:
         return poly_p, f"polymarket-only ({poly_rationale}); kalshi: {kalshi_rationale}"
 
+    # Minimum-volume floor: when Kalshi has a real price, a thin
+    # Polymarket quote (volume < MIN_POLYMARKET_VOLUME_FOR_BLEND) is
+    # likely a secondary listing with stale or wide-spread prices.
+    # Including it in the blend gives bad data ~25% weight (cap is the
+    # ratio cap, not an absolute volume floor). Skip the blend in that
+    # case — use Kalshi alone.
+    if poly_weight < MIN_POLYMARKET_VOLUME_FOR_BLEND:
+        return kalshi_p, (
+            f"{kalshi_rationale}; poly vol ${poly_weight:.0f} < "
+            f"${MIN_POLYMARKET_VOLUME_FOR_BLEND:.0f} floor → skip blend"
+        )
+
     # Cross-venue agreement check: when both venues quote the same answer,
     # there's no information in their agreement — skip the blend.
     if skip_if_agree_within is not None and abs(kalshi_p - poly_p) <= skip_if_agree_within:
@@ -601,7 +622,7 @@ def _market_sanity_check(
     return _wrap_binary(anchored, (resp.rationale or "") + note, event)
 
 
-def _llm_shrink_alpha(rationale: str) -> float:
+def _llm_shrink_alpha(rationale: str, p: float | None = None) -> float:
     """Pick LLM shrinkage strength based on rationale content.
 
     Three tiers, checked in order of decreasing specificity:
@@ -611,9 +632,21 @@ def _llm_shrink_alpha(rationale: str) -> float:
       GROUNDED  → rationale cites current data ("according to", "as of",
                   "polls show", etc.) but no decisive outcome.
       SPECULATIVE → rationale reads as base-rate speculation.
+
+    Decisive false-positive guard: when `p` is provided AND the
+    decisive markers fire BUT the prediction is mid-band [0.20, 0.80],
+    downgrade to grounded. A decisive marker (e.g. "did not win") can
+    misfire on counterfactual rationale ("Team A did not win in 2024
+    but might in 2026"); the structural sanity check is that genuine
+    decisive-evidence forecasts should land near the tails, not the
+    middle. False-negatives here are cheap (we just apply slightly
+    more shrinkage); false-positives at α=0.02 in the mid-band cost
+    real Brier.
     """
     rationale_lower = rationale.lower()
     if any(marker in rationale_lower for marker in _LLM_DECISIVE_MARKERS):
+        if p is not None and 0.20 <= p <= 0.80:
+            return LLM_SHRINK_GROUNDED
         return LLM_SHRINK_DECISIVE
     if any(marker in rationale_lower for marker in _LLM_GROUNDED_MARKERS):
         return LLM_SHRINK_GROUNDED
@@ -678,7 +711,15 @@ def _llm_fallback(event: EventRequest, *, reason: str) -> PredictionResponse:
         return _wrap_binary(0.5, f"{reason}; LLM unavailable; uniform prior", event)
     p_raw, llm_rationale = out
     llm_rationale = llm_rationale + retry_note
-    alpha_base = _llm_shrink_alpha(llm_rationale)
+    # Force speculative tier on the no-search retry: without web search,
+    # the LLM is operating on training-cutoff knowledge alone and any
+    # rationale-text classification (decisive / grounded) is unreliable.
+    # Belt-and-suspenders insurance — no real cost on the happy path
+    # since retry_note only sets when the first attempt failed entirely.
+    if retry_note:
+        alpha_base = LLM_SHRINK_SPECULATIVE
+    else:
+        alpha_base = _llm_shrink_alpha(llm_rationale, p=p_raw)
     p = _llm_shrink_with_tail(p_raw, alpha_base=alpha_base)
     tier = (
         "decisive" if alpha_base == LLM_SHRINK_DECISIVE

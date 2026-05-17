@@ -336,6 +336,57 @@ def test_decisive_beats_grounded_at_extreme_tail():
     assert decisive_p < grounded_p
 
 
+def test_decisive_marker_in_mid_band_downgrades_to_grounded():
+    """Regression for the false-positive case: a rationale with a decisive
+    marker (e.g. "did not win") but a mid-band probability should NOT use
+    the decisive tier — that combination almost certainly means the marker
+    matched a counterfactual phrase ("did not win in 2024 but might in 2026")
+    rather than a confirmed outcome.
+    """
+    # Mid-band p=0.55 with a decisive-marker phrase that's clearly counterfactual.
+    counterfactual_rationale = (
+        "Team A has not yet won the title this season but is well-positioned"
+    )
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.llm_forecast_ensemble", return_value=(0.55, counterfactual_rationale)
+    ):
+        out = predict(_event())
+    # Should report 'grounded' tier (downgraded from decisive), NOT 'decisive'.
+    assert "grounded" in out["rationale"] or "speculative" in out["rationale"]
+    assert "decisive" not in out["rationale"]
+
+
+def test_no_search_retry_forces_speculative_tier():
+    """When the initial ensemble fails and we retry without search, the
+    resulting forecast should be classified as speculative regardless of
+    rationale content. Web-search-less LLM operating on training cutoff
+    knowledge alone is by definition speculation; any "grounded" markers
+    in the rationale are fabricated citations.
+    """
+    # First call returns None (ensemble failure), second call (no-search) returns
+    # a rationale that WOULD normally trigger 'grounded' or 'decisive'.
+    call_count = [0]
+
+    def fake_ensemble(event_d, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return None  # First attempt: fail
+        # Retry: return a response whose rationale would mis-classify as grounded
+        # if not for the force-speculative override.
+        return (0.85, "according to multiple sources, this is very likely")
+
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.category_prior", return_value=None
+    ), patch("agent.predict.llm_forecast_ensemble", side_effect=fake_ensemble):
+        out = predict(_event())
+    # The no-search retry's rationale should force speculative tier.
+    assert "speculative" in out["rationale"]
+    assert "(retry, no-search)" in out["rationale"]
+    # Speculative shrinkage at p=0.85: distance=0.35 < 0.40 threshold, no extra
+    # tail alpha; shrunk = 0.85*0.85 + 0.15*0.5 = 0.7225 + 0.075 = 0.7975.
+    assert out["p_yes"] == pytest.approx(0.7975)
+
+
 def test_predict_speculative_llm_gets_more_shrinkage():
     with patch("agent.predict.get_market", return_value=None), patch(
         "agent.predict.llm_forecast_ensemble",
@@ -536,6 +587,40 @@ def test_safe_band_skips_blend_when_polymarket_agrees():
     assert "skip blend" in out["rationale"] or "poly agrees" in out["rationale"]
     # Final p stays close to Kalshi mid 0.50.
     assert 0.49 < out["p_yes"] < 0.51
+
+
+def test_blend_skipped_when_polymarket_volume_below_floor():
+    """Regression for the thin-Polymarket concern: when Kalshi has signal
+    AND Polymarket vol is below MIN_POLYMARKET_VOLUME_FOR_BLEND, skip the
+    blend entirely (use Kalshi alone). Prevents a stale secondary listing
+    with $500 of volume from getting ~25% weight against a $1M Kalshi book.
+    """
+    from agent.predict import MIN_POLYMARKET_VOLUME_FOR_BLEND
+
+    e = _event()
+    e["category"] = "Politics"
+    e["outcomes"] = ["TeamA", "TeamB"]
+    # Kalshi outside safe band (so blend would normally fire) with deep volume
+    market = {
+        "yes_bid_dollars": "0.84",
+        "yes_ask_dollars": "0.86",
+        "yes_bid_size_fp": "100",
+        "yes_ask_size_fp": "100",
+        "no_bid_dollars": "0.14",
+        "no_ask_dollars": "0.16",
+        "last_price_dollars": "0.85",
+        "volume_24h_fp": "200000",
+    }
+    # Polymarket with stale low-volume quote
+    with patch("agent.predict.get_market", return_value=market), patch(
+        "agent.predict.polymarket_quote",
+        return_value=(0.30, MIN_POLYMARKET_VOLUME_FOR_BLEND - 100, "poly p=0.30 thin"),
+    ):
+        out = predict(e)
+    # Blend should be skipped; final p ≈ kalshi mid 0.85 (after small shrinkage).
+    # Sanity guardrail would NOT fire because we're using kalshi mid directly.
+    assert "skip blend" in out["rationale"]
+    assert out["p_yes"] > 0.70  # closer to Kalshi 0.85 than to Poly 0.30
 
 
 def test_safe_band_blends_when_polymarket_disagrees():
