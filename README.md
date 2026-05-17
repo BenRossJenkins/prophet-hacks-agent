@@ -35,27 +35,47 @@ across that event's outcomes. See "Agent contract" below.
 For binary events:
 
 1. Fetch the Kalshi market by `market_ticker`.
-2. **Tail-anchor triage** — confident liquid market (vol >= $500, price
+2. **Tail-anchor triage**: confident liquid market (vol >= $500, price
    outside [0.05, 0.95]) returns directly with a 3% safety shrink.
-3. **Safe-band auto-anchor** — liquid book in [0.20, 0.80] skips the
-   Polymarket blend (Kalshi is well-calibrated there).
-4. Otherwise, **Polymarket cross-reference** (politics / world / etc.) →
-   volume-weighted blend.
+3. **Cross-venue agreement gate** (politics / world / company / etc.):
+   - In the safe band ([0.20, 0.80] with Kalshi vol >= $10k): fetch
+     Polymarket and **only blend when |kalshi - poly| > 0.03**. When
+     the venues agree, there's no signal in the cross-reference.
+   - Outside the safe band: always volume-weighted-blend with Kalshi.
+4. **Volume-weighted shrinkage** toward 0.5.
 5. If no market signal, **category priors** (NWS for weather, yfinance
    for crypto, ESPN for sports, Manifold elsewhere).
-6. Final fallback: **LLM ensemble** (Claude Opus + GPT-5-mini + Gemini
-   2.5 Flash) with shared web search, median aggregation, tail-aware
-   shrinkage.
-7. **Sanity guardrail** — if final p deviates >0.30 from a deep liquid
-   Kalshi mid, anchor 60/40 toward market.
+6. Final fallback: **cross-vendor LLM ensemble** (Claude Opus
+   extended-thinking + GPT-5-mini + Gemini 2.5 Flash) with shared web
+   search (Anthropic anchors search; OpenAI + Gemini receive its
+   findings as `search_context`). Median aggregation. **Three-tier
+   tail-aware shrinkage:** `decisive` (alpha=0.02 when rationale
+   describes a resolved outcome), `grounded` (alpha=0.05 when it cites
+   current data), `speculative` (alpha=0.15 base-rate reasoning), with
+   extra alpha at |p - 0.5| > 0.40 and a hard cap at alpha=0.50. If
+   the whole ensemble fails, retry once with web search disabled
+   before falling to uniform 0.5.
+7. **Market sanity guardrail**: if final p deviates >0.30 from a deep
+   liquid Kalshi mid, anchor 60/40 toward market.
 8. **Path-stratified calibration** when a fitted table is present (GCS,
-   refit daily during eval).
+   refit daily during eval, ±0.05 shift cap).
 
-Multi-outcome events skip steps 1-5 and try: Polymarket multi-outcome
-event → LLM ensemble with per-outcome distribution → uniform 1/N.
+For multi-outcome events (3+ outcomes):
 
-All paths produce a `{probabilities: [...]}` response strictly summing to
-1, with `market` names matching the event's `outcomes` list exactly.
+1. **Kalshi event lookup** via `/trade-api/v2/events/{event_ticker}
+   ?with_nested_markets=true`. Requires `mutually_exclusive=true`,
+   maps each child market to one of the event's outcomes, requires
+   >=60% coverage.
+2. **Polymarket event lookup** with the same coverage contract.
+3. **Capped volume-weighted blend** of the two (KALSHI_POLY_MAX_WEIGHT
+   = 0.75) when both are available; otherwise use whichever returned.
+4. **LLM ensemble** with explicit `p_yes = P(outcomes[0])` framing and
+   two worked top-K examples in the prompt; retry without web search
+   on total failure.
+5. **Uniform 1/N** as the final fallback.
+
+All paths produce a `{probabilities: [...]}` response strictly summing
+to 1, with `market` names matching the event's `outcomes` list exactly.
 
 ## Setup
 
@@ -139,6 +159,13 @@ no single failure can break a /predict response:
   still running at the deadline are abandoned and the median of whatever
   responses arrived is returned. A single hung LLM vendor cannot
   consume the whole budget.
+- **Retry-without-search on total failure.** When the whole ensemble
+  returns None (all 3 vendors failed simultaneously, typically a search
+  tool rate-limit), we retry once with web search disabled. Base
+  chat-completion APIs rate-limit independently of search tools, so
+  this converts a 0.5-fallback into a real prediction roughly 50% of
+  the time in stress tests. The eval server does NOT retry timed-out
+  requests on our behalf, so this is on us.
 - **Multi-tier market fallback chain.** When the LLM stack is
   unreachable, the agent falls through tail-anchor → Polymarket blend →
   category prior (NWS / yfinance / ESPN / Manifold) → uniform 0.5. Every
@@ -228,7 +255,7 @@ scripts/               operational utilities
 tests/                 unit tests; tests/fixtures/ for backtest data
 ```
 
-248 tests under `pytest tests/`.
+286 tests under `pytest tests/`.
 
 ## Environment
 

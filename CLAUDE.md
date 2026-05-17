@@ -18,16 +18,27 @@ Scoring is Brier (lower is better). See `README.md` for setup and
 
 ```
 predict(event):
-  Multi-outcome (3+ outcomes) → straight to LLM ensemble with explicit
-                                 framing; build per-outcome distribution
-                                 summing to 1; skip everything else.
+  Multi-outcome (3+ outcomes):
+    1. Kalshi event lookup: GET /trade-api/v2/events/{event_ticker}
+       ?with_nested_markets=true. Require mutually_exclusive=true,
+       map child subtitles to outcomes (exact match + token-subset),
+       extract per-child YES probability, require ≥60% coverage.
+    2. Polymarket event lookup via /events with the same coverage
+       contract.
+    3. Capped volume-weighted blend (KALSHI_POLY_MAX_WEIGHT=0.75) when
+       both present; otherwise use whichever returned.
+    4. If neither: LLM ensemble with explicit p_yes=P(outcomes[0])
+       framing + top-K worked examples in the prompt. Retry once
+       with web_search=False on total failure.
+    5. If LLM also fails: uniform 1/N across outcomes.
+    Final distribution always normalized to sum=1.
 
   Binary (2 outcomes):
   1. Fetch Kalshi market by market_ticker.
   2. Derive raw Kalshi price (depth-mid if liquid, else last trade).
   3. Tail-anchor triage: if Kalshi vol_24h ≥ $500 AND raw_p outside
-     [0.05, 0.95], return market price directly — skip Polymarket, LLM,
-     shrinkage. (Tails are settled; LLM disagreement costs Brier.)
+     [0.05, 0.95], return market price directly with a 3% safety
+     shrink. (Tails are settled; LLM disagreement costs Brier.)
   4. Cross-venue agreement gate (POLYMARKET_CATEGORIES only):
         - In safe band ([0.20, 0.80] with vol ≥ $10k): fetch Polymarket
           but skip the blend when |kalshi - poly| ≤ 0.03 (agreement
@@ -41,18 +52,31 @@ predict(event):
   7. LLM ensemble[Opus-thinking, GPT-5-mini, Gemini-2.5-flash] with
      shared web search (Anthropic anchors search, OpenAI + Gemini
      receive its findings as `search_context`) → median → tail-aware
-     non-linear LLM shrinkage. (LLM denylist is currently empty — the
-     safe-band auto-anchor + tail-anchor triage handle the cases the
-     denylist used to gate.)
+     non-linear LLM shrinkage with three tiers:
+       - decisive (α_base=0.02): rationale mentions an outcome that
+         has already resolved (markers: "already won/lost/eliminated/
+         clinched", "did not win", "is impossible", etc.).
+       - grounded (α_base=0.05): rationale cites current data
+         ("according to", "as of", "polls", "source", etc.).
+       - speculative (α_base=0.15): base-rate reasoning only.
+     Plus extra tail α beyond |p - 0.5| > 0.40 to bound overconfident
+     extreme outputs. Capped at α=0.50 to preserve directional signal.
+     If the ensemble returns None (all 3 vendors failed), retry ONCE
+     with web_search=False before falling to uniform 0.5.
+     (LLM denylist is currently empty — the safe-band auto-anchor +
+     tail-anchor triage handle the cases the denylist used to gate.)
   8. Market sanity guardrail: if final p deviates >0.30 from a deep
      liquid Kalshi mid (vol_24h ≥ $100k), anchor 0.6/0.4 toward market.
   9. Path-stratified calibration (binary events only): classify the
-     rationale into one of ~12 pipeline-branch labels, look up that
-     stratum's table from GCS-backed payload (60s cache), require
-     n ≥ MIN_BUCKET_N_FOR_PATH (=5) in the matching bucket — else fall
-     back to the global table. The final shift is bounded to
-     ±MAX_CALIBRATION_SHIFT (=0.05) so a noisy small-N bucket can't
-     yank a confident prediction wildly off.
+     rationale into one of ~13 pipeline-branch labels (tail-anchor,
+     kalshi-anchor, kalshi+poly-blend, guardrail-anchored, prior,
+     llm-decisive, llm-grounded, llm-speculative, multi-outcome-kalshi,
+     multi-outcome-poly, multi-outcome-blend, multi-outcome-llm,
+     multi-outcome-uniform). Look up that stratum's table from
+     GCS-backed payload (60s cache), require n ≥ MIN_BUCKET_N_FOR_PATH
+     (=5) in the matching bucket — else fall back to the global table.
+     The final shift is bounded to ±MAX_CALIBRATION_SHIFT (=0.05) so a
+     noisy small-N bucket can't yank a confident prediction wildly off.
   10. Wrap p_yes into {market: outcomes[0], probability: p},
       {market: outcomes[1], probability: 1-p}. Always clamp p to
       [0.01, 0.99] per submission contract.
