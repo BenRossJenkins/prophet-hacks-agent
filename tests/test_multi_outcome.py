@@ -243,6 +243,8 @@ def test_predict_multi_outcome_skips_market_anchor():
     eurovision_outcomes = [f"Country{i}" for i in range(35)]
     event = _multi_event(eurovision_outcomes, title="Top 5 acts at Eurovision 2026?")
     with patch("agent.predict.get_market") as market_mock, patch(
+        "agent.predict.kalshi_event_distribution", return_value=None
+    ), patch(
         "agent.predict.polymarket_event_distribution", return_value=None
     ), patch(
         "agent.predict.llm_forecast_ensemble_full",
@@ -250,11 +252,18 @@ def test_predict_multi_outcome_skips_market_anchor():
     ):
         out = predict(event)
     market_mock.assert_not_called()
-    # raw=0.20, uniform=5/35≈0.143, shrink=0.30
-    # shrunk = 0.20*0.70 + 0.143*0.30 ≈ 0.183
-    assert out["p_yes"] == pytest.approx(0.20 * 0.70 + (5 / 35) * 0.30)
+    # v3.15: K=5 detected from 'Top 5' title regex → target_sum=5.
+    # LLM gave (raw=0.20, no probs); we synthesize a sum-to-1 dist with
+    # outcomes[0] shrunk = 0.20*0.70 + (5/35)*0.30 ≈ 0.183. Then
+    # _normalize_distribution scales by target_sum=5 →
+    #   outcomes[0] = 0.183 * 5 ≈ 0.915 (within [0,1], no safety fallback).
+    expected_outcomes0 = (0.20 * 0.70 + (5 / 35) * 0.30) * 5
+    assert out["p_yes"] == pytest.approx(expected_outcomes0, abs=0.01)
     assert "multi-outcome" in out["rationale"]
     assert "top-5" in out["rationale"]
+    # Σ should be ≈ 5 (top-K, not 1)
+    total = sum(p["probability"] for p in out["probabilities"])
+    assert total == pytest.approx(5.0, abs=0.01)
 
 
 def test_predict_multi_outcome_uses_polymarket_event_when_available():
@@ -294,14 +303,15 @@ def test_predict_multi_outcome_uses_kalshi_event_when_available():
     ]
     with patch(
         "agent.predict.kalshi_event_distribution",
-        return_value=(kalshi_probs, 25000.0, "kalshi event 'NBA Champ' covered 3/3"),
+        # v3.15: 4-tuple now includes target_sum (1.0 = single-winner)
+        return_value=(kalshi_probs, 25000.0, "kalshi event 'NBA Champ' covered 3/3", 1.0),
     ), patch(
         "agent.predict.polymarket_event_distribution", return_value=None
     ), patch("agent.predict.llm_forecast_ensemble_full") as llm_mock:
         out = predict(event)
     llm_mock.assert_not_called()
     by_market = {p["market"]: p["probability"] for p in out["probabilities"]}
-    # Sum=0.65; normalize → Boston = 0.30/0.65 = 0.4615
+    # Sum=0.65; normalize → Boston = 0.30/0.65 = 0.4615 (target_sum=1)
     assert by_market["Boston Celtics"] == pytest.approx(0.30 / 0.65)
     assert sum(by_market.values()) == pytest.approx(1.0)
     assert "kalshi only" in out["rationale"]
@@ -326,7 +336,7 @@ def test_predict_multi_outcome_blends_kalshi_and_polymarket():
     # Equal volumes → 50/50 blend, but capped at 0.75 → still 50/50 here.
     with patch(
         "agent.predict.kalshi_event_distribution",
-        return_value=(kalshi_probs, 10000.0, "kalshi"),
+        return_value=(kalshi_probs, 10000.0, "kalshi", 1.0),
     ), patch(
         "agent.predict.polymarket_event_distribution",
         return_value=(poly_probs, 10000.0, "poly"),
@@ -353,7 +363,7 @@ def test_predict_multi_outcome_blend_caps_when_volume_skewed():
     # Kalshi vol $1M, Poly vol $100 → naive weight Kalshi 0.9999, but cap to 0.75.
     with patch(
         "agent.predict.kalshi_event_distribution",
-        return_value=(kalshi_probs, 1_000_000.0, "kalshi"),
+        return_value=(kalshi_probs, 1_000_000.0, "kalshi", 1.0),
     ), patch(
         "agent.predict.polymarket_event_distribution",
         return_value=(poly_probs, 100.0, "poly"),

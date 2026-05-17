@@ -79,10 +79,14 @@ class PredictionResponse(BaseModel):
     path: str | None = Field(default=None, exclude=True)
 
 
-# v3.14 — path-stamped at producer, Beta-Bernoulli calibration shrinkage,
-# diff-sanity guard on calibration publish, multi-outcome p_yes aligned
-# with dist[0]. Logged with each prediction for post-eval analysis.
-AGENT_VERSION = "v3.14"
+# v3.15 — sum-to-K for non-mutex multi-outcome events. Organizer-confirmed
+# 2026-05-17 that top-K events should NOT be normalized to sum=1; the
+# server scores probabilities as-is. Kalshi's mutually_exclusive=False
+# is the canonical signal. Live probe (Bundesliga top-4, Eurovision
+# top-5) confirms child prices naturally sum to K. Builds on v3.14
+# (path-stamped at producer, Beta-Bernoulli calibration shrinkage,
+# diff-sanity guard, multi-outcome p_yes aligned with dist[0]).
+AGENT_VERSION = "v3.15"
 
 
 # Liquidity gates
@@ -246,14 +250,23 @@ def _binary_distribution(p: float, outcomes: list[str]) -> list[MarketProbabilit
 
 
 def _normalize_distribution(
-    probs: list[dict] | list[MarketProbability], outcomes: list[str]
+    probs: list[dict] | list[MarketProbability],
+    outcomes: list[str],
+    *,
+    target_sum: float = 1.0,
 ) -> list[MarketProbability]:
-    """Align a probability list to `outcomes` order, fill missing, normalize to 1.0.
+    """Align a probability list to `outcomes` order, fill missing, scale to target_sum.
 
-    Ensures every event outcome has an entry, missing ones get the
-    uniform residual, then renormalize so probabilities sum to 1.0.
-    Critical: server rejects (or rather mis-scores) outputs whose
-    markets don't match event outcomes exactly.
+    target_sum controls what the per-outcome probabilities sum to:
+      - 1.0 (default): single-winner. Each outcome's probability is P(this
+        is THE resolved outcome); they sum to 1 by definition.
+      - K > 1: top-K event. Each outcome's probability is P(this outcome
+        is among the K resolved outcomes); they sum to K by linearity of
+        expectation. Per-outcome values remain in [0, 1].
+
+    The wire-shape rule "each market must match one of the event's outcomes"
+    is enforced here — entries with unknown markets are dropped, missing
+    outcomes are backfilled with the uniform residual against target_sum.
     """
     by_market: dict[str, float] = {}
     for entry in probs:
@@ -271,18 +284,23 @@ def _normalize_distribution(
     missing = [o for o in outcomes if o not in by_market]
     if missing:
         covered_sum = sum(by_market.values())
-        residual = max(0.0, 1.0 - covered_sum)
+        residual = max(0.0, target_sum - covered_sum)
         per_missing = residual / len(missing) if missing else 0.0
         for m in missing:
             by_market[m] = per_missing
 
     total = sum(by_market.get(o, 0.0) for o in outcomes)
     if total <= 0:
-        # All zero — uniform fallback.
-        per = 1.0 / len(outcomes)
+        # All zero — uniform fallback at target_sum/N (each outcome equally
+        # likely, sum to target_sum). For K=1 this is 1/N; for K=k this is k/N.
+        per = target_sum / len(outcomes) if outcomes else 0.0
+        per = max(0.0, min(1.0, per))
         return [MarketProbability(market=o, probability=per) for o in outcomes]
+    # Scale so the sum equals target_sum; clamp each per-outcome value to
+    # [0, 1] (a probability cannot exceed 1 even when the sum is K).
+    scale = target_sum / total
     return [
-        MarketProbability(market=o, probability=by_market[o] / total)
+        MarketProbability(market=o, probability=max(0.0, min(1.0, by_market[o] * scale)))
         for o in outcomes
     ]
 
@@ -312,30 +330,60 @@ def _is_multi_outcome(event: EventRequest) -> bool:
     return event.outcomes is not None and len(event.outcomes) > 2
 
 
-_TOP_K_PATTERN = re.compile(r"top\s+(\d+)|finish.+top\s+(\d+)", re.IGNORECASE)
+# Top-K detection patterns. Each captures the number from an explicit
+# top-K phrasing. Ordered most-specific to least-specific. Required to
+# have an actual integer right after the K-cue word to fire — qualitative
+# phrasings ("multiple winners", "several teams") never trigger sum-to-K.
+_TOP_K_PATTERNS = (
+    re.compile(r"\btop\s+(\d+)\b", re.IGNORECASE),
+    re.compile(r"\bfinish(?:es)?\s+(?:in\s+)?(?:the\s+)?top\s+(\d+)\b", re.IGNORECASE),
+    re.compile(r"\bfirst\s+(\d+)\b", re.IGNORECASE),
+    re.compile(r"\bleading\s+(\d+)\b", re.IGNORECASE),
+    re.compile(r"\b(\d+)\s+(?:winners?|qualif(?:y|iers?)|advance(?:rs?)?)\b", re.IGNORECASE),
+)
 
 
-def _estimate_winners_count(event: EventRequest) -> int:
-    """How many positive outcomes are expected, given the question phrasing.
+def _detect_top_k(event: EventRequest) -> int:
+    """How many outcomes resolve YES in this event. Returns 1 for single-winner.
 
-    Returns 1 by default (single-winner: "Who will win X?"). Returns K when
-    the title clearly says "top K". For ordinal/bucket questions (e.g.
-    "At least N million views") the resolution rule picks exactly one
-    bucket, so K=1 there too.
+    Conservative by design: only returns K > 1 when ALL of the following hold:
+      - An explicit integer follows a top-K cue word in the title or rules
+      - 2 ≤ K < len(outcomes) — single-winner if K is degenerate
+      - len(outcomes) >= 3 — binary events are always K=1
+
+    False positives are catastrophic (sum-to-K distribution submitted for a
+    single-winner event scores wrong on every outcome). False negatives are
+    status quo (today's known leak). So we bias hard toward K=1 on any
+    ambiguity. The Prophet Arena spec confirmed (organizer answer 2026-05-17)
+    that probabilities are scored as-is without normalization, so top-K
+    events should be returned summing to ~K, not ~1.
     """
+    outcomes = event.outcomes or []
+    n_out = len(outcomes)
+    if n_out < 3:
+        return 1
     title = event.title or ""
     rules = event.rules or ""
-    m = _TOP_K_PATTERN.search(title) or _TOP_K_PATTERN.search(rules)
-    if m:
-        for group in m.groups():
-            if group:
-                try:
-                    k = int(group)
-                except ValueError:
-                    continue
-                if 1 <= k <= 20:
-                    return k
+    haystack = f"{title}\n{rules}"
+    for pattern in _TOP_K_PATTERNS:
+        m = pattern.search(haystack)
+        if m is None:
+            continue
+        try:
+            k = int(m.group(1))
+        except (ValueError, IndexError):
+            continue
+        # Range checks. K must be plausible: at least 2, strictly less than
+        # the number of outcomes (otherwise the question is degenerate), and
+        # not absurdly large.
+        if 2 <= k < n_out and k <= 20:
+            return k
     return 1
+
+
+# Kept for backwards compatibility — older code and tests reference the
+# old name. Returns the same value as _detect_top_k for clarity.
+_estimate_winners_count = _detect_top_k
 
 
 def _uniform_prior(event: EventRequest) -> float:
@@ -881,10 +929,12 @@ def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
     event_d = event.model_dump()
     outcomes = event.outcomes or []
     n_out = len(outcomes)
-    k = _estimate_winners_count(event)
     prior = _uniform_prior(event)
 
-    # Step 1: try Kalshi multi-outcome event.
+    # Step 1: try Kalshi multi-outcome event. Returns target_sum which
+    # is the authoritative K signal — 1.0 for mutex=True single-winner
+    # events, K for mutex=False top-K events (where children naturally
+    # sum to ~K). Kalshi's mutex flag is more reliable than text regex.
     try:
         kalshi_out = kalshi_event_distribution(event_d)
     except Exception as e:
@@ -898,13 +948,26 @@ def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
         logger.warning("polymarket event lookup raised: %s", e)
         poly_out = None
 
+    # Determine target_sum (K signal hierarchy):
+    #   1. Kalshi target_sum if Kalshi resolved the event (canonical via mutex)
+    #   2. Text-regex fallback when Kalshi didn't resolve
+    if kalshi_out is not None:
+        target_sum = float(kalshi_out[3])
+    else:
+        target_sum = float(_detect_top_k(event))
+    k = int(round(target_sum))
+
     # Step 3: combine market signals.
     market_dist: list[dict[str, float]] | None = None
     market_rationale: str = ""
     market_path: str = ""
     if kalshi_out is not None and poly_out is not None:
+        # _blend_multi_outcome_distributions takes 3-tuples; pull off the
+        # target_sum field before blending. We keep the kalshi target_sum
+        # since Polymarket doesn't yet surface a comparable signal.
+        kalshi_3 = (kalshi_out[0], kalshi_out[1], kalshi_out[2])
         blended, _vol, rat = _blend_multi_outcome_distributions(
-            kalshi_out, poly_out, outcomes
+            kalshi_3, poly_out, outcomes
         )
         market_dist = blended
         market_rationale = rat
@@ -919,17 +982,16 @@ def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
         market_path = "multi-outcome-poly"
 
     if market_dist is not None:
-        dist = _normalize_distribution(market_dist, outcomes)
+        dist = _normalize_distribution(market_dist, outcomes, target_sum=target_sum)
         # Align p_yes with dist[0] so calibration / logging see the same
-        # outcomes[0] probability the server scores against. Previously
-        # we pulled p_yes from market_dist (pre-normalize) which could
-        # disagree with dist[0] after normalization.
+        # outcomes[0] probability the server scores against.
         p_yes_value = max(0.01, min(0.99, dist[0].probability)) if dist else prior
         return PredictionResponse(
             probabilities=dist,
             p_yes=p_yes_value,
             rationale=(
-                f"multi-outcome ({n_out} options, top-{k}); {market_rationale}"
+                f"multi-outcome ({n_out} options, top-{k}, Σ={target_sum:g}); "
+                f"{market_rationale}"
             ),
             path=market_path,
         )
@@ -945,33 +1007,37 @@ def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
         )
         out = llm_forecast_ensemble_full(event_d, with_web_search=False)
     if out is None:
-        # Uniform fallback. For top-K questions, every outcome is equally
-        # likely, so the distribution is just 1/N across outcomes (which
-        # would naively sum to 1 anyway — perfect).
+        # Uniform fallback. For top-K (K>=2) events the uniform marginal is
+        # K/N per outcome (sums to K). For single-winner it's 1/N (sums to 1).
+        per_outcome = (target_sum / n_out) if n_out > 0 else 0.0
+        per_outcome = max(0.0, min(1.0, per_outcome))
         uniform = [
-            MarketProbability(market=o, probability=1.0 / n_out)
-            for o in outcomes
+            MarketProbability(market=o, probability=per_outcome) for o in outcomes
         ] if n_out > 0 else []
         return PredictionResponse(
             probabilities=uniform,
-            p_yes=max(0.01, min(0.99, prior)),
+            p_yes=max(0.01, min(0.99, per_outcome)),
             rationale=(
-                f"multi-outcome ({n_out} options, top-{k}); LLM unavailable; "
-                f"uniform 1/N across outcomes"
+                f"multi-outcome ({n_out} options, top-{k}, Σ={target_sum:g}); "
+                f"LLM unavailable; uniform K/N across outcomes"
             ),
             path="multi-outcome-uniform",
         )
     raw_p, probabilities, llm_rationale = out
 
-    # Build the per-outcome distribution. If the LLM gave us one, normalize
-    # it to sum to 1 (the LLM was instructed to sum to K for top-K, but the
-    # server contract is strict sum-to-1). If no distribution was provided,
-    # synthesize one from p_yes for outcomes[0] + uniform across the rest.
+    # Build the per-outcome distribution scaled to target_sum (=K). Safety
+    # clamp: if any per-outcome value after scaling exceeds 0.99, the LLM
+    # gave us a malformed distribution for this K (e.g., 0.5 on a K=5 event
+    # would scale to 2.5). Fall back to uniform K/N to ship a defensible
+    # sum-to-K distribution rather than a clamped-and-distorted one.
+    safety_triggered = False
     if probabilities:
-        dist = _normalize_distribution(probabilities, outcomes)
+        dist = _normalize_distribution(probabilities, outcomes, target_sum=target_sum)
     else:
         # Shrink raw_p toward uniform prior k/N first (variance protection),
         # then distribute the remaining mass uniformly across other outcomes.
+        # The synthesized distribution is built to sum to 1; _normalize_
+        # distribution will scale it to target_sum.
         shrunk = (1 - MULTI_LLM_SHRINK) * raw_p + MULTI_LLM_SHRINK * prior
         shrunk = max(0.01, min(0.99, shrunk))
         synthesized = [{"market": outcomes[0], "probability": shrunk}]
@@ -979,20 +1045,33 @@ def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
             per_other = (1.0 - shrunk) / (n_out - 1)
             for o in outcomes[1:]:
                 synthesized.append({"market": o, "probability": per_other})
-        dist = _normalize_distribution(synthesized, outcomes)
+        dist = _normalize_distribution(synthesized, outcomes, target_sum=target_sum)
 
-    # Align p_yes with dist[0] (post-normalization) — same fix as the
-    # market-distribution branch above. Calibration keys off this value;
-    # keeping it in sync with the served distribution prevents the
-    # median-vs-mean disagreement.
+    if target_sum > 1.0 and any(p.probability > 0.99 for p in dist):
+        # LLM distribution doesn't fit K cleanly. Ship uniform K/N as
+        # safety. Bounded error: |dist - uniform_K_over_N| is at most K-1
+        # per-outcome in absolute Brier.
+        safety_triggered = True
+        per_outcome = max(0.0, min(1.0, target_sum / n_out)) if n_out > 0 else 0.0
+        dist = [
+            MarketProbability(market=o, probability=per_outcome)
+            for o in outcomes
+        ]
+
+    # Align p_yes with dist[0] post-normalization — calibration / logging
+    # see the same outcomes[0] probability the server scores against.
     p_yes_value = max(0.01, min(0.99, dist[0].probability)) if dist else prior
 
+    rationale_suffix = (
+        " [safety: scaled prob > 0.99 → uniform K/N]" if safety_triggered else ""
+    )
     return PredictionResponse(
         probabilities=dist,
         p_yes=p_yes_value,
         rationale=(
-            f"multi-outcome ({n_out} options, top-{k}, uniform={prior:.3f}); "
-            f"raw={raw_p:.3f}; {llm_rationale}"
+            f"multi-outcome ({n_out} options, top-{k}, Σ={target_sum:g}, "
+            f"uniform={prior:.3f}); raw={raw_p:.3f}; {llm_rationale}"
+            f"{rationale_suffix}"
         ),
         path="multi-outcome-llm",
     )

@@ -1056,12 +1056,17 @@ def test_predict_multi_outcome_distribution_sums_to_one():
     assert total == pytest.approx(1.0)
 
 
-def test_predict_multi_outcome_normalizes_summing_to_more_than_one():
-    """Top-K LLM outputs sum to K. We must normalize to 1."""
+def test_predict_multi_outcome_topk_preserves_sum_to_k():
+    """v3.15: top-K events submit a sum-to-K distribution, not sum-to-1.
+
+    A 'top 5 finishers' event with K=5 detected from the title: LLM gives a
+    distribution where 25 outcomes are at 0.20 each (sum=5.0). We pass it
+    through scaled to target_sum=5. No safety fallback (no per-outcome
+    value exceeds 0.99). Σ probabilities = 5.
+    """
     e = _event()
     e["outcomes"] = [f"C{i}" for i in range(35)]
     e["title"] = "top 5 finishers"
-    # LLM gives a top-5-style distribution that sums to ~5
     raw_probs = [
         {"market": f"C{i}", "probability": 0.20 if i < 25 else 0.0}
         for i in range(35)
@@ -1070,11 +1075,18 @@ def test_predict_multi_outcome_normalizes_summing_to_more_than_one():
                return_value=(0.20, raw_probs, "r")):
         out = predict(e)
     total = sum(p["probability"] for p in out["probabilities"])
-    assert total == pytest.approx(1.0)
+    # Σ = K = 5 (the natural sum was already 5, scaling factor = 1)
+    assert total == pytest.approx(5.0, abs=0.01)
+    # Each per-outcome is in [0, 1]
+    for p in out["probabilities"]:
+        assert 0.0 <= p["probability"] <= 1.0
 
 
 def test_predict_multi_outcome_uniform_when_llm_fails():
-    """Uniform 1/N distribution when the LLM can't be reached."""
+    """Uniform K/N distribution when the LLM can't be reached.
+
+    For a 5-outcome single-winner event (no top-K phrasing): K=1, uniform = 1/N = 0.2.
+    """
     e = _event()
     e["outcomes"] = ["A", "B", "C", "D", "E"]
     with patch("agent.predict.llm_forecast_ensemble_full", return_value=None):
@@ -1320,7 +1332,7 @@ def test_path_stamp_multi_outcome_kalshi(tmp_path):
     ]
     with patch(
         "agent.predict.kalshi_event_distribution",
-        return_value=(kalshi_dist, 50_000.0, "kalshi event 'X'"),
+        return_value=(kalshi_dist, 50_000.0, "kalshi event 'X'", 1.0),
     ), patch(
         "agent.predict.polymarket_event_distribution", return_value=None
     ):
@@ -1343,7 +1355,7 @@ def test_path_stamp_multi_outcome_blend(tmp_path):
     ]
     with patch(
         "agent.predict.kalshi_event_distribution",
-        return_value=(dist, 50_000.0, "kalshi event 'X'"),
+        return_value=(dist, 50_000.0, "kalshi event 'X'", 1.0),
     ), patch(
         "agent.predict.polymarket_event_distribution",
         return_value=(dist, 25_000.0, "poly event 'X'"),
@@ -1367,6 +1379,185 @@ def test_path_stamp_multi_outcome_uniform_when_llm_fails(tmp_path):
         predict(e)
     entry = _last_log_entry(tmp_path)
     assert entry["metadata"]["path"] == "multi-outcome-uniform"
+
+
+# ---- sum-to-K detection (v3.15) -----------------------------------------
+
+
+def _topk_event(outcomes, title="?"):
+    """Build a multi-outcome event dict suitable for predict()."""
+    return {
+        "event_ticker": "T",
+        "market_ticker": "T",
+        "title": title,
+        "category": "Sports",
+        "close_time": "2026-12-31T23:59:59Z",
+        "outcomes": list(outcomes),
+    }
+
+
+def test_detect_top_k_returns_k_from_explicit_phrasing():
+    """Explicit numeric K in title with K < n_outcomes → K detected."""
+    from agent.predict import EventRequest, _detect_top_k
+    for title, n, expected in [
+        ("Top 4 Bundesliga finishers", 18, 4),
+        ("Top 5 acts at Eurovision", 35, 5),
+        ("first 3 to qualify", 10, 3),
+        ("Top 4", 18, 4),
+        ("Which clubs finish in the top 4 of the league?", 18, 4),
+    ]:
+        e = EventRequest(**_topk_event([f"O{i}" for i in range(n)], title=title))
+        assert _detect_top_k(e) == expected, f"{title!r} with n={n}"
+
+
+def test_detect_top_k_returns_one_for_single_winner_phrasings():
+    """Standard 'who wins' framing with N outcomes → K=1."""
+    from agent.predict import EventRequest, _detect_top_k
+    for title, n in [
+        ("Who will win the 2026 NBA Championship?", 30),
+        ("Will GTA6 ship by May 27?", 2),
+        ("What will US CPI be?", 16),
+        ("Who wins?", 10),
+    ]:
+        e = EventRequest(**_topk_event([f"O{i}" for i in range(n)], title=title))
+        assert _detect_top_k(e) == 1, f"{title!r} with n={n}"
+
+
+def test_detect_top_k_conservative_on_degenerate_cases():
+    """Degenerate top-K phrasings should default to K=1.
+
+    These are the false-positive guardrails: text says 'top N' but the
+    structure rules it out. Submitting sum-to-K when the event is
+    single-winner is catastrophic — bias hard toward K=1.
+    """
+    from agent.predict import EventRequest, _detect_top_k
+    # K equals outcomes count → degenerate ('every outcome wins')
+    e = EventRequest(**_topk_event(["A", "B", "C", "D", "E"], title="Top 5 finishers"))
+    assert _detect_top_k(e) == 1
+    # K exceeds outcomes count → impossible
+    e = EventRequest(**_topk_event(["A", "B", "C"], title="Top 5 finishers"))
+    assert _detect_top_k(e) == 1
+    # Binary events: always K=1 regardless of phrasing
+    e = EventRequest(**_topk_event(["A", "B"], title="Will A be in top 2 finishers?"))
+    assert _detect_top_k(e) == 1
+    # No explicit numeric K → K=1
+    e = EventRequest(**_topk_event([f"O{i}" for i in range(10)], title="Multiple winners possible"))
+    assert _detect_top_k(e) == 1
+    # K must be at least 2 to fire
+    e = EventRequest(**_topk_event([f"O{i}" for i in range(10)], title="Top 1 finisher"))
+    assert _detect_top_k(e) == 1
+
+
+def test_normalize_distribution_scales_to_target_sum():
+    """target_sum=K rescales the distribution to sum to K, per-outcome clamped to [0,1]."""
+    from agent.predict import _normalize_distribution
+
+    outcomes = ["A", "B", "C", "D"]
+    # Input sums to 1: A=0.5, B=0.3, C=0.15, D=0.05
+    probs = [
+        {"market": "A", "probability": 0.5},
+        {"market": "B", "probability": 0.3},
+        {"market": "C", "probability": 0.15},
+        {"market": "D", "probability": 0.05},
+    ]
+    # target_sum=1 → unchanged
+    dist = _normalize_distribution(probs, outcomes, target_sum=1.0)
+    by_m = {p.market: p.probability for p in dist}
+    assert by_m["A"] == pytest.approx(0.5)
+    assert sum(by_m.values()) == pytest.approx(1.0)
+
+    # target_sum=2 → each scaled by 2
+    dist = _normalize_distribution(probs, outcomes, target_sum=2.0)
+    by_m = {p.market: p.probability for p in dist}
+    assert by_m["A"] == pytest.approx(1.0)  # 0.5 * 2 = 1.0 (clamped to [0,1])
+    assert by_m["B"] == pytest.approx(0.6)
+    assert by_m["D"] == pytest.approx(0.1)
+
+
+def test_normalize_distribution_clamps_above_one_when_scaling():
+    """A scaled per-outcome value over 1 is clamped to 1 (probability ceiling)."""
+    from agent.predict import _normalize_distribution
+
+    outcomes = ["A", "B", "C"]
+    probs = [
+        {"market": "A", "probability": 0.6},  # *3 = 1.8 → clamp 1.0
+        {"market": "B", "probability": 0.3},  # *3 = 0.9
+        {"market": "C", "probability": 0.1},  # *3 = 0.3
+    ]
+    dist = _normalize_distribution(probs, outcomes, target_sum=3.0)
+    by_m = {p.market: p.probability for p in dist}
+    assert by_m["A"] == pytest.approx(1.0)
+    assert by_m["B"] == pytest.approx(0.9)
+
+
+def test_predict_topk_kalshi_passes_through_with_target_sum_K(tmp_path):
+    """v3.15: Kalshi mutex=False event returns target_sum=K; predict()
+    submits a sum-to-K distribution unchanged from Kalshi's children."""
+    outcomes = [f"O{i}" for i in range(10)]
+    event = _topk_event(outcomes, title="Top 3 winners")
+    # Kalshi children sum to ~3 (top-3 event); each is a marginal in [0,1]
+    kalshi_probs = [
+        {"market": "O0", "probability": 0.90},
+        {"market": "O1", "probability": 0.75},
+        {"market": "O2", "probability": 0.60},
+        {"market": "O3", "probability": 0.30},
+        {"market": "O4", "probability": 0.20},
+        {"market": "O5", "probability": 0.15},
+        {"market": "O6", "probability": 0.05},
+        {"market": "O7", "probability": 0.03},
+        {"market": "O8", "probability": 0.01},
+        {"market": "O9", "probability": 0.01},
+    ]
+    with patch(
+        "agent.predict.kalshi_event_distribution",
+        # 4-tuple: probs, vol, rationale, target_sum=3
+        return_value=(kalshi_probs, 50_000.0, "kalshi mutex=F top-3", 3.0),
+    ), patch(
+        "agent.predict.polymarket_event_distribution", return_value=None
+    ), patch("agent.predict.llm_forecast_ensemble_full") as llm_mock:
+        out = predict(event)
+    llm_mock.assert_not_called()
+    total = sum(p["probability"] for p in out["probabilities"])
+    # Σ ≈ 3 (top-K) not 1
+    assert total == pytest.approx(3.0, abs=0.01)
+    by_m = {p["market"]: p["probability"] for p in out["probabilities"]}
+    # Per-outcome values stay in [0,1]; relative ordering preserved
+    assert by_m["O0"] > by_m["O1"] > by_m["O2"] > by_m["O3"]
+    for p in out["probabilities"]:
+        assert 0.0 <= p["probability"] <= 1.0
+
+
+def test_predict_topk_llm_safety_clamp_falls_back_to_uniform(tmp_path):
+    """When the LLM gives a sum-to-1 distribution that scales to >0.99 per
+    outcome under K, fall back to uniform K/N rather than ship a distorted
+    (clamped) distribution."""
+    outcomes = [f"O{i}" for i in range(10)]
+    event = _topk_event(outcomes, title="Top 5 finishers")
+    # LLM gave 0.5 to O0 — scaled by K=5 = 2.5, clamped 1.0. Triggers safety.
+    raw_probs = [
+        {"market": "O0", "probability": 0.5},
+        {"market": "O1", "probability": 0.1},
+        {"market": "O2", "probability": 0.1},
+        {"market": "O3", "probability": 0.1},
+        {"market": "O4", "probability": 0.1},
+        {"market": "O5", "probability": 0.05},
+        {"market": "O6", "probability": 0.025},
+        {"market": "O7", "probability": 0.025},
+        {"market": "O8", "probability": 0.0},
+        {"market": "O9", "probability": 0.0},
+    ]
+    with patch("agent.predict.kalshi_event_distribution", return_value=None), patch(
+        "agent.predict.polymarket_event_distribution", return_value=None
+    ), patch(
+        "agent.predict.llm_forecast_ensemble_full",
+        return_value=(0.5, raw_probs, "concentrated mass"),
+    ):
+        out = predict(event)
+    by_m = {p["market"]: p["probability"] for p in out["probabilities"]}
+    # Safety triggered → uniform K/N = 5/10 = 0.5 per outcome
+    for prob in by_m.values():
+        assert prob == pytest.approx(0.5)
+    assert "safety" in out["rationale"]
 
 
 def test_predict_one_outcome_event_returns_single_market(tmp_path):

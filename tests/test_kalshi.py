@@ -220,29 +220,48 @@ def test_kalshi_event_distribution_mutually_exclusive():
             "outcomes": ["Boston Celtics", "Denver Nuggets", "Oklahoma City Thunder"],
         })
     assert result is not None
-    probs, vol, _ = result
+    probs, vol, _, target_sum = result
     by_outcome = {p["market"]: p["probability"] for p in probs}
     assert by_outcome["Boston Celtics"] == pytest.approx(0.29)
     assert by_outcome["Denver Nuggets"] == pytest.approx(0.19)
     assert by_outcome["Oklahoma City Thunder"] == pytest.approx(0.13)
     assert vol == 25000
+    # Single-winner event → target_sum = 1.0
+    assert target_sum == pytest.approx(1.0)
 
 
-def test_kalshi_event_distribution_not_mutually_exclusive_returns_none():
+def test_kalshi_event_distribution_not_mutually_exclusive_returns_topk():
+    """v3.15: mutex=False is no longer auto-rejected. We now return the
+    children with their natural probabilities and target_sum=K (round of
+    Σ children clamped to [2, n_out-1])."""
     mock_resp = MagicMock()
+    # 5 children with prices summing to ~3.0 → K=3 implied
     mock_resp.json.return_value = {
         "event": {
-            "event_ticker": "X", "mutually_exclusive": False,
+            "event_ticker": "X", "mutually_exclusive": False, "title": "Top 3 event",
             "markets": [
-                {"ticker": "X-1", "subtitle": "A", "yes_bid": 50, "yes_ask": 52, "status": "active"},
+                {"ticker": "X-A", "subtitle": "A", "yes_bid_dollars": 0.85, "yes_ask_dollars": 0.90, "volume_24h_fp": 1000, "status": "active"},
+                {"ticker": "X-B", "subtitle": "B", "yes_bid_dollars": 0.75, "yes_ask_dollars": 0.80, "volume_24h_fp": 1000, "status": "active"},
+                {"ticker": "X-C", "subtitle": "C", "yes_bid_dollars": 0.65, "yes_ask_dollars": 0.70, "volume_24h_fp": 1000, "status": "active"},
+                {"ticker": "X-D", "subtitle": "D", "yes_bid_dollars": 0.05, "yes_ask_dollars": 0.10, "volume_24h_fp": 1000, "status": "active"},
+                {"ticker": "X-E", "subtitle": "E", "yes_bid_dollars": 0.02, "yes_ask_dollars": 0.05, "volume_24h_fp": 1000, "status": "active"},
             ],
         }
     }
     mock_resp.raise_for_status = lambda: None
     with patch("agent.kalshi.requests.get", return_value=mock_resp):
-        assert kalshi_event_distribution({
-            "event_ticker": "X", "outcomes": ["A", "B", "C"],
-        }) is None
+        result = kalshi_event_distribution({
+            "event_ticker": "X", "outcomes": ["A", "B", "C", "D", "E"],
+        })
+    assert result is not None
+    probs, _vol, _rat, target_sum = result
+    # Σ children mids ≈ 0.875 + 0.775 + 0.675 + 0.075 + 0.035 = 2.435 → round → K=2
+    # Within range [2, n_out-1=4] → target_sum = 2.0
+    assert target_sum == pytest.approx(2.0)
+    # Per-outcome probabilities are the raw mids (passed through)
+    by_outcome = {p["market"]: p["probability"] for p in probs}
+    assert by_outcome["A"] == pytest.approx(0.875)
+    assert by_outcome["B"] == pytest.approx(0.775)
 
 
 def test_kalshi_event_distribution_insufficient_coverage():

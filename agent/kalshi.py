@@ -227,21 +227,32 @@ def _derive_event_ticker(market_ticker: str | None) -> str | None:
 
 def kalshi_event_distribution(
     event: dict,
-) -> tuple[list[dict[str, float]], float, str] | None:
+) -> tuple[list[dict[str, float]], float, str, float] | None:
     """Pull a multi-outcome probability distribution from a Kalshi event.
 
-    Returns (probabilities_list, total_volume_24h, rationale). None if:
+    Returns (probabilities_list, total_volume_24h, rationale, target_sum).
+    target_sum is the natural sum of the per-outcome probabilities:
+      - mutually_exclusive=True (single-winner): children sum to ~1, so
+        target_sum = 1.0.
+      - mutually_exclusive=False (top-K): each child is an independent
+        binary 'this outcome is among the resolved K'. Children naturally
+        sum to ~K. target_sum = round(Σ children) clamped to [1, n_out-1],
+        and the children's probabilities pass through to the caller
+        without forced renormalization.
+
+    Returns None if:
       - event_ticker can't be determined
       - event has fewer than 3 outcomes (use the binary path)
       - Kalshi event fetch fails
-      - event is NOT mutually_exclusive (child markets are independent
-        binaries, not a joint distribution — bailing is correct)
       - outcome coverage falls below MIN_OUTCOMES_COVERED
 
-    Caller is responsible for normalizing to sum=1.
+    Caller respects target_sum: for sum-to-1 events, normalize the
+    output. For sum-to-K events, pass through (each per-outcome already
+    in [0,1] is a valid marginal probability).
     """
     outcomes = event.get("outcomes") or []
-    if len(outcomes) < 3:
+    n_out = len(outcomes)
+    if n_out < 3:
         return None
 
     event_ticker = (
@@ -255,12 +266,7 @@ def kalshi_event_distribution(
     if ev is None:
         return None
 
-    # mutually_exclusive guarantees child markets sum (approximately) to 1.
-    # When false, children are independent binaries and don't form a joint
-    # distribution — bail.
-    if not ev.get("mutually_exclusive", False):
-        return None
-
+    mutex = bool(ev.get("mutually_exclusive", False))
     children = ev.get("markets") or []
     if not children:
         return None
@@ -279,18 +285,36 @@ def kalshi_event_distribution(
         by_outcome[mapped] = max(0.0, min(1.0, p))
         total_vol += _read_volume(child)
 
-    coverage = len(by_outcome) / len(outcomes)
+    coverage = len(by_outcome) / n_out
     if coverage < MIN_OUTCOMES_COVERED:
         return None
 
     probs: list[dict[str, float]] = [
         {"market": o, "probability": by_outcome.get(o, 0.0)} for o in outcomes
     ]
-    ev_title = (ev.get("title") or event_ticker)[:80]
     raw_sum = sum(by_outcome.values())
+
+    # Determine target_sum.
+    #
+    # mutex=True: canonical single-winner. Children sum to ~1; caller
+    # normalizes to exactly 1.
+    #
+    # mutex=False: top-K. Children sum to ~K naturally. We trust the
+    # market's K: round(raw_sum) clamped to [2, n_out-1]. If the rounded
+    # value is degenerate (1 or >= n_out), fall back to treating the
+    # event as single-winner so we don't ship a wrong-shape submission.
+    if mutex:
+        target_sum = 1.0
+    else:
+        # Snap raw_sum to nearest integer K, clamped to plausible range.
+        k_implied = max(1, min(n_out - 1, round(raw_sum)))
+        target_sum = float(k_implied) if k_implied >= 2 else 1.0
+
+    ev_title = (ev.get("title") or event_ticker)[:80]
+    mutex_label = "mutex=T" if mutex else "mutex=F"
     rationale = (
-        f"kalshi event '{ev_title}' "
-        f"covered {len(by_outcome)}/{len(outcomes)} outcomes, "
+        f"kalshi event '{ev_title}' ({mutex_label}, target_sum={target_sum:g}) "
+        f"covered {len(by_outcome)}/{n_out} outcomes, "
         f"sum={raw_sum:.3f}, vol24h=${total_vol:.0f}"
     )
-    return probs, total_vol, rationale
+    return probs, total_vol, rationale, target_sum
