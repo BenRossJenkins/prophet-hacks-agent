@@ -581,7 +581,17 @@ def llm_forecast_ensemble_full(
     is_multi = isinstance(outcomes, list) and len(outcomes) > 2
 
     if len(models) == 1:
-        out = llm_forecast_full(event, model=models[0], with_web_search=with_web_search)
+        # Defensive: an unexpected exception from the single vendor (e.g.,
+        # SDK bug, malformed response) must not propagate out of the
+        # ensemble. Treat it like a None return so the caller can retry
+        # without web search or fall to uniform.
+        try:
+            out = llm_forecast_full(
+                event, model=models[0], with_web_search=with_web_search
+            )
+        except Exception as e:
+            logger.warning("single-vendor ensemble (%s) raised: %s", models[0], e)
+            return None
         if out is None:
             return None
         return out
@@ -597,9 +607,19 @@ def llm_forecast_ensemble_full(
     if with_web_search:
         anchor_model, other_models = _split_anchor(models)
         if anchor_model is not None:
-            anchor_out = llm_forecast_full(
-                event, model=anchor_model, with_web_search=True
-            )
+            # Defensive: any exception from the anchor (SDK bug, network
+            # error not caught internally, parse failure) must not bring
+            # down the whole ensemble — the other vendors should still
+            # run. Treat a raised exception identically to a None return.
+            try:
+                anchor_out = llm_forecast_full(
+                    event, model=anchor_model, with_web_search=True
+                )
+            except Exception as e:
+                logger.warning(
+                    "ensemble anchor (%s) raised: %s", anchor_model, e
+                )
+                anchor_out = None
             if anchor_out is not None:
                 results.append((anchor_model, anchor_out))
                 # Share findings with the parallel callers. We strip the

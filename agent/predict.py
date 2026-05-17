@@ -79,17 +79,16 @@ class PredictionResponse(BaseModel):
     path: str | None = Field(default=None, exclude=True)
 
 
-# v3.16 — Kalshi coverage on settled markets. Previously _kalshi_child_p_yes
-# rejected any status outside (None, "active", "open"), losing the Kalshi
-# anchor on NBA Finals (status="finalized"), Bundesliga top-4
-# (status="closed"), Eurovision top-5, FA Cup, etc. — exactly the
-# high-confidence settled-multi-outcome events where Kalshi is most
-# valuable. Now accepts "finalized"/"closed"/"settled" and uses the
-# `result` field directly when present (yes→1.0, no→0.0). Also tightened
-# K-detection priority: when Kalshi reports mutex=False but the title
-# gives an explicit K ("top 4"), text K wins over rounded Σ-children K.
-# Builds on v3.15 (sum-to-K for non-mutex multi-outcome).
-AGENT_VERSION = "v3.16"
+# v3.17 — defensive exception handling on the LLM ensemble's sequential
+# paths. Previously the search anchor and the single-model short-circuit
+# both let exceptions propagate out, meaning a single Anthropic SDK
+# exception (network, parse, rate-limit-not-caught-internally) would kill
+# the whole ensemble — including preventing the other two vendors from
+# running. Now any exception from the anchor or single-model call is
+# caught and treated identically to a None return, so /predict survives
+# any single-vendor failure. Builds on v3.16 (Kalshi settled-market
+# coverage), v3.15 (sum-to-K), v3.14 (path-stamping).
+AGENT_VERSION = "v3.17"
 
 
 # Liquidity gates
