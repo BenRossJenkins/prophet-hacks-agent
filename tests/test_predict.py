@@ -1490,6 +1490,58 @@ def test_normalize_distribution_clamps_above_one_when_scaling():
     assert by_m["B"] == pytest.approx(0.9)
 
 
+def test_k_priority_text_overrides_kalshi_when_both_present(tmp_path):
+    """When Kalshi reports a noisy K (mutex=False, target_sum=5 from
+    rounding Σ=4.83) and the title gives an explicit 'top 4', the title
+    wins. Bundesliga top-4 case."""
+    outcomes = [f"Team{i}" for i in range(18)]
+    event = {
+        "event_ticker": "T", "market_ticker": "T",
+        "title": "Which clubs will finish in the top 4 of the league?",
+        "category": "Sports", "close_time": "2026-12-31T23:59:59Z",
+        "outcomes": outcomes,
+    }
+    # Kalshi reports children that round to K=5 — but text says top 4.
+    kalshi_probs = [
+        {"market": o, "probability": 0.27} for o in outcomes  # sums to 4.86
+    ]
+    with patch(
+        "agent.predict.kalshi_event_distribution",
+        return_value=(kalshi_probs, 1000.0, "kalshi mutex=F target_sum=5", 5.0),
+    ), patch(
+        "agent.predict.polymarket_event_distribution", return_value=None
+    ):
+        out = predict(event)
+    total = sum(p["probability"] for p in out["probabilities"])
+    # Title-explicit K=4 wins over Kalshi's K=5 from rounding 4.86.
+    assert total == pytest.approx(4.0, abs=0.01)
+
+
+def test_k_priority_kalshi_mutex_true_overrides_text(tmp_path):
+    """When Kalshi says mutex=True (definitively single-winner) but the
+    title coincidentally contains 'top N', mutex wins. Single-winner
+    structural signal beats text ambiguity."""
+    outcomes = [f"Team{i}" for i in range(8)]
+    event = {
+        "event_ticker": "T", "market_ticker": "T",
+        "title": "Will this team be in the top 4 of the standings?",  # text mentions "top 4"
+        "category": "Sports", "close_time": "2026-12-31T23:59:59Z",
+        "outcomes": outcomes,
+    }
+    kalshi_probs = [{"market": o, "probability": 1.0/8} for o in outcomes]
+    with patch(
+        "agent.predict.kalshi_event_distribution",
+        # mutex=True canonical single-winner
+        return_value=(kalshi_probs, 1000.0, "kalshi mutex=T", 1.0),
+    ), patch(
+        "agent.predict.polymarket_event_distribution", return_value=None
+    ):
+        out = predict(event)
+    total = sum(p["probability"] for p in out["probabilities"])
+    # mutex=True wins — sum-to-1 even though title mentions "top 4"
+    assert total == pytest.approx(1.0, abs=0.01)
+
+
 def test_predict_topk_kalshi_passes_through_with_target_sum_K(tmp_path):
     """v3.15: Kalshi mutex=False event returns target_sum=K; predict()
     submits a sum-to-K distribution unchanged from Kalshi's children."""

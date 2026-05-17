@@ -79,14 +79,17 @@ class PredictionResponse(BaseModel):
     path: str | None = Field(default=None, exclude=True)
 
 
-# v3.15 — sum-to-K for non-mutex multi-outcome events. Organizer-confirmed
-# 2026-05-17 that top-K events should NOT be normalized to sum=1; the
-# server scores probabilities as-is. Kalshi's mutually_exclusive=False
-# is the canonical signal. Live probe (Bundesliga top-4, Eurovision
-# top-5) confirms child prices naturally sum to K. Builds on v3.14
-# (path-stamped at producer, Beta-Bernoulli calibration shrinkage,
-# diff-sanity guard, multi-outcome p_yes aligned with dist[0]).
-AGENT_VERSION = "v3.15"
+# v3.16 — Kalshi coverage on settled markets. Previously _kalshi_child_p_yes
+# rejected any status outside (None, "active", "open"), losing the Kalshi
+# anchor on NBA Finals (status="finalized"), Bundesliga top-4
+# (status="closed"), Eurovision top-5, FA Cup, etc. — exactly the
+# high-confidence settled-multi-outcome events where Kalshi is most
+# valuable. Now accepts "finalized"/"closed"/"settled" and uses the
+# `result` field directly when present (yes→1.0, no→0.0). Also tightened
+# K-detection priority: when Kalshi reports mutex=False but the title
+# gives an explicit K ("top 4"), text K wins over rounded Σ-children K.
+# Builds on v3.15 (sum-to-K for non-mutex multi-outcome).
+AGENT_VERSION = "v3.16"
 
 
 # Liquidity gates
@@ -949,12 +952,32 @@ def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
         poly_out = None
 
     # Determine target_sum (K signal hierarchy):
-    #   1. Kalshi target_sum if Kalshi resolved the event (canonical via mutex)
-    #   2. Text-regex fallback when Kalshi didn't resolve
+    #
+    # The QUESTION TEXT is authoritative when it gives an explicit K
+    # ("top 4 Bundesliga finishers" → K=4 by definition; Kalshi's
+    # Σ children = 4.83 rounding to 5 is market noise, not the truth).
+    # Kalshi's mutex flag is canonical for the SINGLE-WINNER vs TOP-K
+    # split, but K itself comes from the title when stated.
+    #
+    # Resolution order:
+    #   1. Kalshi mutex=True → target_sum=1 (definitive single-winner)
+    #   2. Explicit text K (≥2) → target_sum=K
+    #   3. Kalshi mutex=False with no text K → target_sum from Σ children
+    #   4. No Kalshi data → text K (regex only)
+    text_k = _detect_top_k(event)
     if kalshi_out is not None:
-        target_sum = float(kalshi_out[3])
+        kalshi_target_sum = float(kalshi_out[3])
+        if kalshi_target_sum == 1.0:
+            # mutex=True from Kalshi: definitively single-winner.
+            target_sum = 1.0
+        elif text_k >= 2:
+            # Kalshi says top-K AND text gives explicit K. Trust text.
+            target_sum = float(text_k)
+        else:
+            # Kalshi says top-K but text is silent. Trust Kalshi's K.
+            target_sum = kalshi_target_sum
     else:
-        target_sum = float(_detect_top_k(event))
+        target_sum = float(text_k)
     k = int(round(target_sum))
 
     # Step 3: combine market signals.

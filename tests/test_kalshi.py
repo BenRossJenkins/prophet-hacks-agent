@@ -73,9 +73,60 @@ def test_child_p_yes_blends_when_wide_but_liquid():
     assert _kalshi_child_p_yes(child) == pytest.approx(expected)
 
 
-def test_child_p_yes_returns_none_on_closed_status():
+def test_child_p_yes_accepts_settled_status():
+    """v3.15: settled / finalized / closed are now accepted; the post-
+    resolution price still carries meaningful signal. Only truly unusable
+    statuses (cancelled, unknown) return None."""
+    # Settled market with price-only signal (no `result` set) falls through
+    # to the existing price logic.
     child = {"yes_bid": 28, "yes_ask": 30, "status": "settled"}
-    assert _kalshi_child_p_yes(child) is None
+    assert _kalshi_child_p_yes(child) == pytest.approx(0.29)
+    # Truly bad status → None.
+    assert _kalshi_child_p_yes({"yes_bid": 28, "yes_ask": 30, "status": "cancelled"}) is None
+
+
+def test_child_p_yes_uses_result_field_for_finalized_markets():
+    """Kalshi pattern: status='finalized' + result='yes'/'no' is the
+    market's definitive answer. Return 1.0/0.0 (the [0, 1] endpoints —
+    Brier-0 on correct settled outcomes)."""
+    child_no = {
+        "status": "finalized", "result": "no",
+        "yes_bid_dollars": "0.0000", "yes_ask_dollars": "0.0100",
+        "last_price_dollars": "0.0100",
+    }
+    assert _kalshi_child_p_yes(child_no) == pytest.approx(0.0)
+    child_yes = {
+        "status": "finalized", "result": "yes",
+        "yes_bid_dollars": "0.9900", "yes_ask_dollars": "1.0000",
+        "last_price_dollars": "0.9900",
+    }
+    assert _kalshi_child_p_yes(child_yes) == pytest.approx(1.0)
+
+
+def test_child_p_yes_ignores_unexpected_result_values():
+    """Result values other than 'yes'/'no' (e.g., 'void', empty string)
+    fall through to the existing price extraction path."""
+    child = {
+        "status": "finalized", "result": "void",
+        "yes_bid_dollars": "0.50", "yes_ask_dollars": "0.52",
+        "volume_24h_fp": "100",
+    }
+    # spread = 0.02 ≤ 0.10 → mid = 0.51
+    assert _kalshi_child_p_yes(child) == pytest.approx(0.51)
+
+
+def test_child_p_yes_closed_market_falls_through_to_last_price():
+    """Bundesliga pattern: status='closed', result='' (empty), bid/ask
+    collapsed to 0/1, but last_price still carries the market's belief."""
+    child = {
+        "status": "closed", "result": "",
+        "yes_bid_dollars": "0.0000", "yes_ask_dollars": "1.0000",
+        "last_price_dollars": "0.9900",
+        "volume_24h_fp": "0.00",
+    }
+    # bid=0, ask=1, spread=1 > 0.10, vol=0 < min_liquid → falls through
+    # to last_price branch which returns 0.99.
+    assert _kalshi_child_p_yes(child) == pytest.approx(0.99)
 
 
 def test_child_p_yes_handles_dollars_variant():
@@ -233,18 +284,19 @@ def test_kalshi_event_distribution_mutually_exclusive():
 def test_kalshi_event_distribution_not_mutually_exclusive_returns_topk():
     """v3.15: mutex=False is no longer auto-rejected. We now return the
     children with their natural probabilities and target_sum=K (round of
-    Σ children clamped to [2, n_out-1])."""
+    Σ children clamped to [2, n_out-1]), provided the sum is close enough
+    to an integer to be unambiguous (within AMBIGUITY_TOL=0.30)."""
     mock_resp = MagicMock()
-    # 5 children with prices summing to ~3.0 → K=3 implied
+    # 5 children with mids summing to 2.95 (≈ K=3, well within tolerance)
     mock_resp.json.return_value = {
         "event": {
             "event_ticker": "X", "mutually_exclusive": False, "title": "Top 3 event",
             "markets": [
-                {"ticker": "X-A", "subtitle": "A", "yes_bid_dollars": 0.85, "yes_ask_dollars": 0.90, "volume_24h_fp": 1000, "status": "active"},
-                {"ticker": "X-B", "subtitle": "B", "yes_bid_dollars": 0.75, "yes_ask_dollars": 0.80, "volume_24h_fp": 1000, "status": "active"},
-                {"ticker": "X-C", "subtitle": "C", "yes_bid_dollars": 0.65, "yes_ask_dollars": 0.70, "volume_24h_fp": 1000, "status": "active"},
-                {"ticker": "X-D", "subtitle": "D", "yes_bid_dollars": 0.05, "yes_ask_dollars": 0.10, "volume_24h_fp": 1000, "status": "active"},
-                {"ticker": "X-E", "subtitle": "E", "yes_bid_dollars": 0.02, "yes_ask_dollars": 0.05, "volume_24h_fp": 1000, "status": "active"},
+                {"ticker": "X-A", "subtitle": "A", "yes_bid_dollars": 0.95, "yes_ask_dollars": 0.97, "volume_24h_fp": 1000, "status": "active"},
+                {"ticker": "X-B", "subtitle": "B", "yes_bid_dollars": 0.85, "yes_ask_dollars": 0.87, "volume_24h_fp": 1000, "status": "active"},
+                {"ticker": "X-C", "subtitle": "C", "yes_bid_dollars": 0.75, "yes_ask_dollars": 0.77, "volume_24h_fp": 1000, "status": "active"},
+                {"ticker": "X-D", "subtitle": "D", "yes_bid_dollars": 0.25, "yes_ask_dollars": 0.27, "volume_24h_fp": 1000, "status": "active"},
+                {"ticker": "X-E", "subtitle": "E", "yes_bid_dollars": 0.04, "yes_ask_dollars": 0.06, "volume_24h_fp": 1000, "status": "active"},
             ],
         }
     }
@@ -255,13 +307,41 @@ def test_kalshi_event_distribution_not_mutually_exclusive_returns_topk():
         })
     assert result is not None
     probs, _vol, _rat, target_sum = result
-    # Σ children mids ≈ 0.875 + 0.775 + 0.675 + 0.075 + 0.035 = 2.435 → round → K=2
-    # Within range [2, n_out-1=4] → target_sum = 2.0
-    assert target_sum == pytest.approx(2.0)
+    # Σ mids = 0.96 + 0.86 + 0.76 + 0.26 + 0.05 = 2.89 → round → K=3
+    # |2.89 - 3| = 0.11 < 0.30 tol → target_sum = 3.0
+    assert target_sum == pytest.approx(3.0)
     # Per-outcome probabilities are the raw mids (passed through)
     by_outcome = {p["market"]: p["probability"] for p in probs}
-    assert by_outcome["A"] == pytest.approx(0.875)
-    assert by_outcome["B"] == pytest.approx(0.775)
+    assert by_outcome["A"] == pytest.approx(0.96)
+
+
+def test_kalshi_event_distribution_ambiguous_sum_falls_back_to_single_winner():
+    """When mutex=False but the children's sum is ambiguous (e.g., 4.5,
+    equidistant between K=4 and K=5), default to single-winner so we
+    don't ship a wrong-shape distribution."""
+    mock_resp = MagicMock()
+    # Sum = 4.50 — ambiguous. Should fall back to target_sum=1.0.
+    mock_resp.json.return_value = {
+        "event": {
+            "event_ticker": "X", "mutually_exclusive": False, "title": "Ambiguous K",
+            "markets": [
+                {"ticker": f"X-{i}", "subtitle": chr(ord("A") + i),
+                 "yes_bid_dollars": 0.49, "yes_ask_dollars": 0.51,
+                 "volume_24h_fp": 1000, "status": "active"}
+                for i in range(9)
+            ],
+        }
+    }
+    mock_resp.raise_for_status = lambda: None
+    with patch("agent.kalshi.requests.get", return_value=mock_resp):
+        result = kalshi_event_distribution({
+            "event_ticker": "X",
+            "outcomes": [chr(ord("A") + i) for i in range(9)],
+        })
+    assert result is not None
+    _, _, _, target_sum = result
+    # Σ mids = 9 * 0.5 = 4.5; |4.5 - 4| = 0.5 > 0.3, |4.5 - 5| = 0.5 > 0.3 → ambiguous → 1.0
+    assert target_sum == pytest.approx(1.0)
 
 
 def test_kalshi_event_distribution_insufficient_coverage():

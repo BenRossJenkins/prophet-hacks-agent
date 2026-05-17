@@ -135,16 +135,43 @@ def _kalshi_child_p_yes(child: dict, *, min_liquid_vol: float = MIN_LIQUID_VOL_F
     """Derive a p_yes from a Kalshi child market.
 
     Preference:
-      1. Depth-mid (yes_bid + yes_ask) / 2 if both present AND book is
+      1. `result` field when set to 'yes' or 'no' — definitive for
+         finalized markets (eliminated teams, settled outcomes). Returns
+         0.99/0.01 respectively. Live-probe-confirmed pattern: Kalshi
+         marks settled children with status='finalized' and a `result`
+         value; we used to reject these on status alone, losing the
+         entire NBA Finals / FA Cup / Eurovision distributions.
+      2. Depth-mid (yes_bid + yes_ask) / 2 if both present AND book is
          either tight-spread (≤ 0.10) or liquid (vol ≥ min_liquid_vol).
-      2. Last trade price if available.
-      3. Mid of (yes_bid, yes_ask) even on thin book.
-      4. Single side if only one is present.
-      5. None — caller excludes this outcome from coverage.
+      3. Last trade price if available — used when a market has closed
+         but the result hasn't been written yet (Kalshi status='closed'
+         with empty `result` field).
+      4. Mid of (yes_bid, yes_ask) even on thin book.
+      5. Single side if only one is present.
+      6. None — caller excludes this outcome from coverage.
+
+    Accepts statuses 'active', 'open', 'finalized', 'closed', 'settled'.
+    Only fully-rejected statuses (None values, 'cancelled', etc.) return None.
     """
     status = child.get("status")
-    if status not in (None, "active", "open"):
+    # Allow active/open AND post-resolution statuses (finalized, closed,
+    # settled). These all carry meaningful price data; rejecting them
+    # leaves Kalshi's authoritative resolution signal unused.
+    if status not in (None, "active", "open", "finalized", "closed", "settled"):
         return None
+
+    # When the market has a definitive `result`, use it directly. Returns
+    # 1.0/0.0 (the submission contract permits [0, 1] inclusive). Brier-0
+    # on correct settled outcomes beats the 0.0001 we'd incur with a
+    # 0.99/0.01 hedge, and Kalshi's `result` field is authoritative —
+    # once it's "yes" or "no" the market is closed and the answer is
+    # already known. Unknown / unexpected result values (e.g., "void",
+    # empty string) fall through to price extraction.
+    result = child.get("result")
+    if result == "yes":
+        return 1.0
+    if result == "no":
+        return 0.0
 
     p_bid = _read_price(child, "yes_bid", dollars_keys=("yes_bid_dollars",))
     p_ask = _read_price(child, "yes_ask", dollars_keys=("yes_ask_dollars",))
@@ -299,16 +326,24 @@ def kalshi_event_distribution(
     # mutex=True: canonical single-winner. Children sum to ~1; caller
     # normalizes to exactly 1.
     #
-    # mutex=False: top-K. Children sum to ~K naturally. We trust the
-    # market's K: round(raw_sum) clamped to [2, n_out-1]. If the rounded
-    # value is degenerate (1 or >= n_out), fall back to treating the
-    # event as single-winner so we don't ship a wrong-shape submission.
+    # mutex=False: top-K. Children sum to ~K naturally. Snap raw_sum to
+    # the nearest integer K, but only when the sum is close enough to
+    # that integer to be unambiguous (within AMBIGUITY_TOL). A raw_sum
+    # of 4.5 is equidistant between K=4 and K=5; defaulting to K=1 in
+    # that ambiguous case is the safe choice. The caller's priority
+    # logic typically overrides this with the title's explicit K when
+    # present, so this only fires when text gives nothing.
+    AMBIGUITY_TOL = 0.30
     if mutex:
         target_sum = 1.0
     else:
-        # Snap raw_sum to nearest integer K, clamped to plausible range.
-        k_implied = max(1, min(n_out - 1, round(raw_sum)))
-        target_sum = float(k_implied) if k_implied >= 2 else 1.0
+        rounded = round(raw_sum)
+        if abs(raw_sum - rounded) <= AMBIGUITY_TOL:
+            k_implied = max(1, min(n_out - 1, rounded))
+            target_sum = float(k_implied) if k_implied >= 2 else 1.0
+        else:
+            # Ambiguous (e.g., raw_sum=4.5): conservative fallback.
+            target_sum = 1.0
 
     ev_title = (ev.get("title") or event_ticker)[:80]
     mutex_label = "mutex=T" if mutex else "mutex=F"
