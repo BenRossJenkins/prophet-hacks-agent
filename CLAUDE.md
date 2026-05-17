@@ -178,6 +178,26 @@ internally. Additional shrinkage on top would double-count.
    brilliant while being useless forward-looking. `scripts/backtest.py
    --with-llm` already disables web search — don't undo that.
 
+7. **Two coupled thresholds gate the market-anchor path** (both in
+   `agent/predict.py`):
+
+   - `MIN_VOL_24H = 10` — minimum 24h volume (USD) below which we
+     normally reject the book as too noisy to trust.
+   - `TIGHT_SPREAD_FOR_LOW_VOL = 0.03` — bypass: a book with a
+     bid-ask spread tighter than this is trusted at *any* volume,
+     even zero. Captures settled-direction markets (e.g. 0.99/1.00
+     pinned book with no recent trades) where the market has
+     unambiguous consensus but volume is zero because there's
+     nothing left to trade against. Added v3.12 after a market-
+     baseline backtest showed agent losing 0.025 Brier on this
+     exact pattern (Trump-event rows in the candlestick fixture);
+     bypass closed two-thirds of that gap.
+
+   If you change either, re-run the market-baseline comparison
+   (`/tmp/market_baseline_compare.py` pattern — local fixture
+   comparison against raw Kalshi mid) to verify the per-category
+   deltas don't regress.
+
 ## Backtest workflow
 
 Two fixtures live under `tests/fixtures/`:
