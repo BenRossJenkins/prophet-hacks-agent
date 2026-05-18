@@ -10,7 +10,10 @@
   <array>
     <string>/bin/bash</string>
     <string>-lc</string>
-    <string>/Users/benjenkins/Documents/AI FORECASTING HACKATHON/scripts/daily_calibration.sh</string>
+    <!-- Path contains spaces. Without quoting, bash -lc word-splits on
+         "AI FORECASTING HACKATHON" and fails with exit 127. Single
+         quotes inside the command string protect the spaces. -->
+    <string>'/Users/benjenkins/Documents/AI FORECASTING HACKATHON/scripts/daily_calibration.sh'</string>
   </array>
 
   <key>StartCalendarInterval</key>
