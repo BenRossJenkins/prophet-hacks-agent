@@ -7,11 +7,14 @@ actual outcome.
 
 Log format (JSONL, one record per line):
 {
-  "ts":         ISO timestamp of prediction,
-  "event":      event dict passed to predict(),
-  "p_yes":      float (probability of outcomes[0]),
-  "rationale":  str (verbose human-readable),
-  "metadata":   {
+  "ts":            ISO timestamp of prediction,
+  "event":         event dict passed to predict(),
+  "p_yes":         float (probability of outcomes[0]),
+  "probabilities": [{"market": str, "probability": float}, ...] |
+                   omitted (the wire distribution; needed for true
+                   per-outcome Brier on multi-outcome events post-eval),
+  "rationale":     str (verbose human-readable),
+  "metadata":      {
     "path":            str — which pipeline branch produced this prediction
                        ("tail-anchor"/"safe-band-anchor"/"poly-only"/
                         "kalshi+poly-blend"/"kalshi-anchor"/"guardrail-anchored"/
@@ -129,13 +132,24 @@ def classify_path(rationale: str) -> str:
 
 
 def log_prediction(
-    event: dict, p_yes: float, rationale: str, metadata: dict[str, Any] | None = None
+    event: dict,
+    p_yes: float,
+    rationale: str,
+    metadata: dict[str, Any] | None = None,
+    probabilities: list[dict[str, Any]] | None = None,
 ) -> None:
     """Append a single prediction to the log file. Never raises.
 
     `metadata` is auto-populated with the classified path if absent.
     Callers can pass extra fields (e.g. p_yes_pre_calibration) and they
     will be merged in.
+
+    `probabilities` is the wire distribution (list of {market, probability}
+    dicts) the agent submitted to the server. When provided, it is
+    persisted alongside `p_yes` so post-eval Brier analysis can score
+    every outcome of a multi-outcome event, not just outcomes[0]. Omitted
+    from the log entry when None to preserve backwards-compat with older
+    callers and tests.
     """
     try:
         path = get_log_path()
@@ -152,13 +166,15 @@ def log_prediction(
         # rationale text for legacy / external entries that didn't stamp.
         if "path" not in meta or not meta["path"]:
             meta["path"] = classify_path(rationale)
-        entry = {
+        entry: dict[str, Any] = {
             "ts": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             "event": event,
             "p_yes": float(p_yes) if p_yes is not None else None,
             "rationale": rationale,
             "metadata": meta,
         }
+        if probabilities is not None:
+            entry["probabilities"] = probabilities
         with path.open("a") as f:
             f.write(json.dumps(entry) + "\n")
     except Exception as e:

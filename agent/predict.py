@@ -1243,12 +1243,19 @@ def predict(event: dict) -> dict:
     event_obj = EventRequest(**event)
     resp = _forecast(event_obj)
     resp = _maybe_calibrate(resp, event_obj)
-    log_prediction(event, resp.p_yes, resp.rationale, metadata=_log_metadata(resp))
+    probabilities_serialized = [
+        {"market": p.market, "probability": p.probability}
+        for p in resp.probabilities
+    ]
+    log_prediction(
+        event,
+        resp.p_yes,
+        resp.rationale,
+        metadata=_log_metadata(resp),
+        probabilities=probabilities_serialized,
+    )
     return {
-        "probabilities": [
-            {"market": p.market, "probability": p.probability}
-            for p in resp.probabilities
-        ],
+        "probabilities": probabilities_serialized,
         "p_yes": resp.p_yes,
         "rationale": resp.rationale,
     }
@@ -1262,7 +1269,14 @@ async def predict_endpoint(event: EventRequest) -> PredictionResponse:
     resp = _forecast(event)
     resp = _maybe_calibrate(resp, event)
     log_prediction(
-        event.model_dump(), resp.p_yes, resp.rationale, metadata=_log_metadata(resp)
+        event.model_dump(),
+        resp.p_yes,
+        resp.rationale,
+        metadata=_log_metadata(resp),
+        probabilities=[
+            {"market": p.market, "probability": p.probability}
+            for p in resp.probabilities
+        ],
     )
     return resp
 

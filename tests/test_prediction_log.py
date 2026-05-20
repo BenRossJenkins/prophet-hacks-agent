@@ -84,6 +84,35 @@ def test_log_prediction_adds_metadata(tmp_path: Path, monkeypatch):
     assert r["metadata"]["n_outcomes"] == 2
 
 
+def test_log_prediction_persists_probabilities_when_passed(
+    tmp_path: Path, monkeypatch
+):
+    target = tmp_path / "preds.jsonl"
+    monkeypatch.setenv("PREDICTION_LOG_PATH", str(target))
+    dist = [
+        {"market": "Yes", "probability": 0.72},
+        {"market": "No", "probability": 0.28},
+    ]
+    log_prediction(
+        {"market_ticker": "X", "outcomes": ["Yes", "No"]},
+        0.72,
+        "r",
+        probabilities=dist,
+    )
+    r = json.loads(target.read_text().strip())
+    assert r["probabilities"] == dist
+
+
+def test_log_prediction_omits_probabilities_when_absent(
+    tmp_path: Path, monkeypatch
+):
+    target = tmp_path / "preds.jsonl"
+    monkeypatch.setenv("PREDICTION_LOG_PATH", str(target))
+    log_prediction({"market_ticker": "X"}, 0.5, "r")
+    r = json.loads(target.read_text().strip())
+    assert "probabilities" not in r
+
+
 def test_log_prediction_merges_extra_metadata(tmp_path: Path, monkeypatch):
     target = tmp_path / "preds.jsonl"
     monkeypatch.setenv("PREDICTION_LOG_PATH", str(target))
