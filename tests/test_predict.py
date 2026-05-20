@@ -289,6 +289,35 @@ def test_predict_falls_back_to_uniform_when_both_market_and_llm_fail():
     assert "LLM unavailable" in out["rationale"]
 
 
+def test_predict_flags_binary_vs_multi_contract_mismatch():
+    """When the request is binary but get_event reveals the SAME ticker
+    has ≥3 nested markets on Kalshi, append a diagnostic tag to the
+    failure rationale (no behavior change, just visibility for post-eval).
+    """
+    multi_event = {
+        "title": "Whatever",
+        "markets": [{"ticker": "A"}, {"ticker": "B"}, {"ticker": "C"}],
+    }
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.get_event", return_value=multi_event
+    ), patch("agent.predict.llm_forecast_ensemble", return_value=None):
+        out = predict(_event())
+    assert "binary-vs-multi-mismatch" in out["rationale"]
+    assert "3 nested markets" in out["rationale"]
+
+
+def test_predict_no_mismatch_tag_when_event_is_truly_binary():
+    """Negative case: get_event returns None (or <3 nested markets) →
+    no diagnostic tag appended. Ensures the heuristic doesn't false-positive
+    on genuinely-missing tickers.
+    """
+    with patch("agent.predict.get_market", return_value=None), patch(
+        "agent.predict.get_event", return_value=None
+    ), patch("agent.predict.llm_forecast_ensemble", return_value=None):
+        out = predict(_event())
+    assert "binary-vs-multi-mismatch" not in out["rationale"]
+
+
 def test_predict_retries_ensemble_without_search_on_total_failure():
     """When the first ensemble call returns None (all vendors failed),
     retry once with with_web_search=False before falling to 0.5."""

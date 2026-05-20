@@ -31,7 +31,7 @@ from agent.calibrate import (
     get_calibration_data,
     get_calibration_table,
 )
-from agent.kalshi import get_market, kalshi_event_distribution
+from agent.kalshi import get_event, get_market, kalshi_event_distribution
 from agent.llm import llm_forecast, llm_forecast_ensemble, llm_forecast_ensemble_full
 from agent.polymarket import polymarket_event_distribution, polymarket_quote
 from agent.prediction_log import log_prediction
@@ -1106,6 +1106,32 @@ def _multi_outcome_forecast(event: EventRequest) -> PredictionResponse:
     )
 
 
+def _detect_binary_vs_multi_mismatch(market_ticker: str) -> str:
+    """Diagnostic: when a binary request's market fetch fails, check
+    whether the SAME ticker resolves to a multi-outcome Kalshi event.
+
+    Returns a short tag to append to the failure rationale when a
+    mismatch is detected, else empty string. Pure diagnostic — never
+    raises, never alters predict() behavior. The signal feeds post-eval
+    analysis on whether Prophet Arena's binary requests systematically
+    omit underlying multi-outcome structure (see KXSPACEXSTARSHIP-12).
+    """
+    try:
+        ev = get_event(market_ticker)
+        if ev is None:
+            return ""
+        nested = ev.get("markets") or []
+        if len(nested) >= 3:
+            return (
+                f" [binary-vs-multi-mismatch: ticker resolves to event "
+                f"with {len(nested)} nested markets]"
+            )
+    except Exception:
+        # Diagnostic must never break /predict.
+        pass
+    return ""
+
+
 def _forecast(event: EventRequest) -> PredictionResponse:
     if _is_multi_outcome(event):
         return _multi_outcome_forecast(event)
@@ -1113,10 +1139,12 @@ def _forecast(event: EventRequest) -> PredictionResponse:
     market = get_market(event.market_ticker)
 
     if market is None:
+        mismatch_tag = _detect_binary_vs_multi_mismatch(event.market_ticker)
+        fail_reason = f"kalshi fetch failed for {event.market_ticker}{mismatch_tag}"
         # Kalshi fetch failed entirely. Try Polymarket as an alternative
         # market-anchor before reaching for priors / LLM.
         poly_p, poly_rationale, blend_kind = _blend_with_polymarket(
-            event, None, None, f"kalshi fetch failed for {event.market_ticker}"
+            event, None, None, fail_reason
         )
         if poly_p is not None:
             p = _shrink_and_clamp(poly_p, alpha=MIN_SHRINK_ALPHA)
@@ -1124,7 +1152,7 @@ def _forecast(event: EventRequest) -> PredictionResponse:
                 p, poly_rationale, event,
                 path=_BLEND_KIND_TO_PATH.get(blend_kind, "poly-only"),
             )
-        return _llm_fallback(event, reason=f"kalshi fetch failed for {event.market_ticker}")
+        return _llm_fallback(event, reason=fail_reason)
 
     arb_violated = _no_arb_violated(market)
     raw_p, rationale = _market_implied_prob(market, arb_violated=arb_violated)
