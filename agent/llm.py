@@ -692,8 +692,13 @@ def llm_forecast_ensemble_full(
         )
 
     def _short(model: str) -> str:
-        parts = model.split("-")
-        return parts[1] if len(parts) > 1 else model
+        if model.startswith("claude"):
+            return "claude"
+        if model.startswith("gpt") or model.startswith("o1") or model.startswith("o3"):
+            return "gpt"
+        if model.startswith("gemini"):
+            return "gemini"
+        return model.split("-", 1)[0]
 
     parts = [f"{_short(m)}={out[0]:.3f}" for m, out in results]
     rationale = f"ensemble[{','.join(parts)}] → median={p_median:.3f}; " + "; ".join(

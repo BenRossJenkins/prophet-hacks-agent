@@ -121,7 +121,7 @@ def check_vendor_latency(predictions: list[dict]) -> tuple[bool, str]:
     """Surface p50/p99 latency per vendor from rationale strings.
 
     Rationale format from our ensemble:
-      `ensemble[opus=0.32,5=0.18,2.5=0.50] -> median=...`
+      `ensemble[claude=0.32,gpt=0.18,gemini=0.50] -> median=...`
     We don't actually have per-event latency stamps in the log right now
     (would require a separate field in `log_prediction`). For now this
     check just reports the COUNT of predictions per vendor as a proxy.
@@ -129,7 +129,7 @@ def check_vendor_latency(predictions: list[dict]) -> tuple[bool, str]:
     """
     if not predictions:
         return True, "no predictions in window (expected day 1)"
-    vendor_seen = {"opus": 0, "5": 0, "2.5": 0}  # gpt-5-mini, gemini-2.5
+    vendor_seen = {"claude": 0, "gpt": 0, "gemini": 0}
     total = 0
     for row in predictions:
         rat = row.get("rationale", "") or ""
