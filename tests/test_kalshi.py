@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.kalshi import (
+    _children_are_threshold,
     _derive_event_ticker,
     _kalshi_child_p_yes,
     _map_kalshi_child_to_outcome,
@@ -313,6 +314,109 @@ def test_kalshi_event_distribution_not_mutually_exclusive_returns_topk():
     # Per-outcome probabilities are the raw mids (passed through)
     by_outcome = {p["market"]: p["probability"] for p in probs}
     assert by_outcome["A"] == pytest.approx(0.96)
+
+
+# ---- _children_are_threshold helper ----
+
+
+def test_children_are_threshold_all_above_labels():
+    children = [
+        {"yes_sub_title": "Above 4.500"},
+        {"yes_sub_title": "Above 4.510"},
+        {"yes_sub_title": "Above 4.520"},
+    ]
+    assert _children_are_threshold(children) is True
+
+
+def test_children_are_threshold_mixed_labels_rejected():
+    children = [
+        {"yes_sub_title": "Above 4.500"},
+        {"yes_sub_title": "Janice STFU"},  # name-style: not a threshold
+        {"yes_sub_title": "Above 4.520"},
+    ]
+    assert _children_are_threshold(children) is False
+
+
+def test_children_are_threshold_too_few_children_rejected():
+    children = [{"yes_sub_title": "Above 1"}, {"yes_sub_title": "Above 2"}]
+    assert _children_are_threshold(children) is False
+
+
+def test_children_are_threshold_falls_back_to_subtitle():
+    """When yes_sub_title is missing, the helper should accept `subtitle`."""
+    children = [
+        {"subtitle": "≥ 5 times"},
+        {"subtitle": "≥ 7 times"},
+        {"subtitle": "≥ 10 times"},
+    ]
+    assert _children_are_threshold(children) is True
+
+
+def test_children_are_threshold_case_insensitive():
+    children = [
+        {"yes_sub_title": "ABOVE 100"},
+        {"yes_sub_title": "Above 200"},
+        {"yes_sub_title": "above 300"},
+    ]
+    assert _children_are_threshold(children) is True
+
+
+# ---- threshold-K-detection at the kalshi_event_distribution layer ----
+
+
+def test_kalshi_event_distribution_threshold_event_snaps_outside_tol():
+    """KXLASTWORDCOUNT-style: Σ=7.484 (outside AMBIGUITY_TOL=0.30) but all
+    children are threshold-style → snap to K=7, not the K=1 fallback."""
+    # 15 children, mid-price 0.499 each → Σ = 7.485 (rounds to 7, |off| = 0.485 > 0.30)
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {
+        "event": {
+            "event_ticker": "X", "mutually_exclusive": False, "title": "How many times",
+            "markets": [
+                {"ticker": f"X-{i}", "yes_sub_title": f"Above {i} times",
+                 "yes_bid_dollars": 0.490, "yes_ask_dollars": 0.508,
+                 "volume_24h_fp": 1000, "status": "active"}
+                for i in range(15)
+            ],
+        }
+    }
+    mock_resp.raise_for_status = lambda: None
+    with patch("agent.kalshi.requests.get", return_value=mock_resp):
+        result = kalshi_event_distribution({
+            "event_ticker": "X",
+            "outcomes": [f"Above {i} times" for i in range(15)],
+        })
+    assert result is not None
+    _, _, rationale, target_sum = result
+    # Σ ≈ 0.499 × 15 = 7.485 → round 7, OUTSIDE old 0.30 tol, but threshold→snap
+    assert target_sum == pytest.approx(7.0), f"expected K=7, got {target_sum}; rationale: {rationale}"
+
+
+def test_kalshi_event_distribution_non_threshold_event_outside_tol_still_falls_back():
+    """Same Σ=7.485 but children labeled as song names (not threshold-style)
+    must still fall back to K=1, preserving the safe-default behavior."""
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {
+        "event": {
+            "event_ticker": "X", "mutually_exclusive": False, "title": "Top song",
+            "markets": [
+                {"ticker": f"X-{i}", "yes_sub_title": f"Song {i}",
+                 "yes_bid_dollars": 0.490, "yes_ask_dollars": 0.508,
+                 "volume_24h_fp": 1000, "status": "active"}
+                for i in range(15)
+            ],
+        }
+    }
+    mock_resp.raise_for_status = lambda: None
+    with patch("agent.kalshi.requests.get", return_value=mock_resp):
+        result = kalshi_event_distribution({
+            "event_ticker": "X",
+            "outcomes": [f"Song {i}" for i in range(15)],
+        })
+    assert result is not None
+    _, _, _, target_sum = result
+    # Σ outside tol AND not threshold-style → K=1 fallback (unchanged behavior)
+    assert target_sum == pytest.approx(1.0)
 
 
 def test_kalshi_event_distribution_ambiguous_sum_falls_back_to_single_winner():

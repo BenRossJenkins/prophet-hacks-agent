@@ -252,6 +252,36 @@ def _derive_event_ticker(market_ticker: str | None) -> str | None:
     return parts[0]
 
 
+# Threshold-style child subtitle prefixes (case-insensitive). When ALL
+# children of a mutex=False event begin with one of these, the event is
+# structurally a cumulative threshold ladder ("Above $4.50", "≥ 7 times",
+# "More than 100k claims") and Σ-children is the natural K even when it
+# rounds outside AMBIGUITY_TOL. Added 2026-05-23 after 3 confirmed cliff
+# events (KXLASTWORDCOUNT, KXJOBLESSCLAIMS, KXTRUEV) where K=1 fallback
+# was catastrophically wrong (truth K was 4-9, per-event Brier 0.30-0.48).
+THRESHOLD_PREFIXES = (
+    "above", "over", "more than", "at least", "≥", ">=",
+    "under", "less than", "below", "fewer than", "≤", "<=",
+    "at most", "greater than",
+)
+
+
+def _children_are_threshold(markets: list[dict]) -> bool:
+    """All children have threshold-style subtitles (cumulative ladder).
+
+    Strict gate: requires ≥3 children AND every child's `yes_sub_title`
+    (or `subtitle` fallback) starts with one of THRESHOLD_PREFIXES. One
+    mismatch kicks back to the conservative K=1 fallback behavior.
+    """
+    if len(markets) < 3:
+        return False
+    for m in markets:
+        sub = (m.get("yes_sub_title") or m.get("subtitle") or "").lower().strip()
+        if not sub or not any(sub.startswith(p) for p in THRESHOLD_PREFIXES):
+            return False
+    return True
+
+
 def kalshi_event_distribution(
     event: dict,
 ) -> tuple[list[dict[str, float]], float, str, float] | None:
@@ -327,22 +357,27 @@ def kalshi_event_distribution(
     # normalizes to exactly 1.
     #
     # mutex=False: top-K. Children sum to ~K naturally. Snap raw_sum to
-    # the nearest integer K, but only when the sum is close enough to
-    # that integer to be unambiguous (within AMBIGUITY_TOL). A raw_sum
-    # of 4.5 is equidistant between K=4 and K=5; defaulting to K=1 in
-    # that ambiguous case is the safe choice. The caller's priority
-    # logic typically overrides this with the title's explicit K when
-    # present, so this only fires when text gives nothing.
+    # the nearest integer K when:
+    #   (a) |raw_sum - round(raw_sum)| ≤ AMBIGUITY_TOL (tight to integer), OR
+    #   (b) all child subtitles are threshold-style ("Above X", "≥ Y", etc.)
+    #       AND round(raw_sum) is a plausible K. Threshold-style children
+    #       are structurally cumulative — Σ IS K by construction, even if
+    #       the mid-price sum lands noisily outside the tolerance.
+    # Otherwise (ambiguous Σ and not clearly threshold-structured),
+    # fall back to single-winner K=1 as the safe choice.
     AMBIGUITY_TOL = 0.30
     if mutex:
         target_sum = 1.0
     else:
         rounded = round(raw_sum)
-        if abs(raw_sum - rounded) <= AMBIGUITY_TOL:
+        in_tol = abs(raw_sum - rounded) <= AMBIGUITY_TOL
+        threshold_event = _children_are_threshold(children)
+        plausible_k = 2 <= rounded <= n_out - 1
+        if in_tol or (threshold_event and plausible_k):
             k_implied = max(1, min(n_out - 1, rounded))
             target_sum = float(k_implied) if k_implied >= 2 else 1.0
         else:
-            # Ambiguous (e.g., raw_sum=4.5): conservative fallback.
+            # Ambiguous (e.g., raw_sum=4.5 with mixed labels): conservative fallback.
             target_sum = 1.0
 
     ev_title = (ev.get("title") or event_ticker)[:80]
