@@ -95,7 +95,7 @@ class PredictionResponse(BaseModel):
 # The agent never reads this field — purely a defensive shape fix.
 # Builds on v3.17 (defensive LLM ensemble), v3.16 (Kalshi settled-market
 # coverage), v3.15 (sum-to-K), v3.14 (path-stamping).
-AGENT_VERSION = "v3.18"
+AGENT_VERSION = "v3.19"
 
 
 # Liquidity gates
